@@ -8,19 +8,39 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from pdd_chat import OUTPUT_DIR
+from paths import OUTPUT_DIR
 
 
 # ============================================================
 # 基础配置
 # ============================================================
+#
+# OpenAI 客户端做懒加载：模块顶层不再直接实例化，避免只跑 Phase 1/3
+# 也强制要求 DEEPSEEK_API_KEY。首次调用 get_client() 时才读环境变量、
+# 校验缺失并抛错。
 
-load_dotenv()
+_client: OpenAI | None = None
 
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com",
-)
+
+def get_client() -> OpenAI:
+    """懒加载 DeepSeek 客户端；缺 key 时给出明确错误。"""
+    global _client
+    if _client is not None:
+        return _client
+
+    load_dotenv()
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "缺少环境变量 DEEPSEEK_API_KEY。请在项目根目录的 .env 文件中配置："
+            "\n  DEEPSEEK_API_KEY=<你的 key>"
+        )
+
+    _client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com",
+    )
+    return _client
 
 # 申诉凭证类型：AI 判定结果只允许是下面 3 种之一。
 APPEAL_EVIDENCE_OPTIONS = [
@@ -297,7 +317,7 @@ def classify_appeal_evidence(compact_data: dict) -> str:
         ensure_ascii=False,
     )
 
-    resp = client.chat.completions.create(
+    resp = get_client().chat.completions.create(
         model="deepseek-v4-flash",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -341,7 +361,7 @@ def generate_appeal_text(compact_data: dict, evidence_label: str) -> str:
         ensure_ascii=False,
     )
 
-    resp = client.chat.completions.create(
+    resp = get_client().chat.completions.create(
         model="deepseek-v4-flash",
         messages=[
             {"role": "system", "content": APPEAL_TEXT_SYSTEM_PROMPT},

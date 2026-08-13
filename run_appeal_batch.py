@@ -20,18 +20,15 @@ from appeal_classifier import (
     compact_chat_json,
     generate_appeal_text,
 )
+from blockers import clear_blockers, safe_click
+from login import open_chat_page, wait_for_login
+from paths import OUTPUT_DIR, PROFILE_DIR
 from pdd_chat import (
-    OUTPUT_DIR,
-    PROFILE_DIR,
-    clear_blockers,
     click_next_page,
-    open_chat_page,
-    safe_click,
     query_chat_records,
     save_chat_records,
-    save_error_screenshot,
-    wait_for_login,
 )
+from screenshots import save_error_screenshot
 
 
 # ============================================================

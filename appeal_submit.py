@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from playwright.sync_api import (
@@ -16,24 +17,19 @@ from stealth import (
     human_delay,
     human_type,
     jitter_wait,
-    stealth_safe_click,
 )
 
-from pdd_chat import (
+from paths import (
     BASE_DIR,
     DEBUG_DIR,
     EVIDENCE_DIR,
     OUTPUT_DIR,
     PROFILE_DIR,
-    clear_blockers,
-    ensure_no_captcha,
-    get_query_button,
-    is_captcha_visible,
-    safe_click,
-    safe_filename,
-    save_error_screenshot,
-    wait_for_login,
 )
+from blockers import clear_blockers, safe_click, stealth_safe_click
+from captcha import ensure_no_captcha, is_captcha_visible
+from login import get_query_button, wait_for_login
+from screenshots import safe_filename, save_error_screenshot
 
 
 # ============================================================
@@ -338,9 +334,16 @@ def get_view_detail_link(
     必须靠文字区分，否则可能点错。
     """
 
+    # 用正则 + 负向环视避免子串误命中：如果 PDD 表格里同时有
+    # "1260805-xxx" 和 "260805-xxx" 这样一个订单号是另一个的后缀的
+    # 情况，纯 has_text=order_no 会同时匹配两行。这里要求 order_no
+    # 前后都不是数字或连字符，才算真正的整段订单号。
+    order_no_pattern = re.compile(
+        rf"(?<![\d\-]){re.escape(order_no)}(?![\d\-])"
+    )
     row = page.locator(
         'tbody[data-testid="beast-core-table-middle-tbody"] tr'
-    ).filter(has_text=order_no)
+    ).filter(has_text=order_no_pattern)
 
     return row.locator(
         'a[data-testid="beast-core-button-link"]'
@@ -568,9 +571,12 @@ def detect_detail_page_status(detail_page: Page) -> str:
         timeout=15_000,
     )
 
+    # 全部走 .first：pdd 详情页有时会在不同容器里各挂一个
+    # detail_status__2shmG（含内嵌 statusText/statusName），
+    # 不加 .first 直接调 inner_text() 会撞 Playwright strict mode。
     text_block = status_block.locator("div.detail_statusText__2tLhY")
     text_content = (
-        text_block.inner_text()
+        text_block.first.inner_text()
         if text_block.count() > 0
         else ""
     )
@@ -582,7 +588,7 @@ def detect_detail_page_status(detail_page: Page) -> str:
 
     # 读取整个 status_block 的文本（含 statusName 区域），用于检测"已申诉"
     full_status_text = (
-        status_block.inner_text() if status_block.count() > 0 else ""
+        status_block.first.inner_text() if status_block.count() > 0 else ""
     )
 
     has_a_marker = STATUS_A_TEXT_MARKER in text_content

@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
@@ -36,13 +37,10 @@ from appeal_submit import (
     open_appeal_search_page,
     search_and_open_appeal_detail,
 )
-from pdd_chat import (
-    OUTPUT_DIR,
-    PROFILE_DIR,
-    save_error_screenshot,
-    set_auto_solve_captcha,
-    wait_for_login,
-)
+from captcha import set_auto_solve_captcha
+from login import wait_for_login
+from paths import OUTPUT_DIR, PROFILE_DIR
+from screenshots import save_error_screenshot
 from run_appeal_batch import (
     collect_all_appealable_order_numbers,
     open_appeal_list_page,
@@ -141,7 +139,10 @@ def _resolve_order_numbers(
         return args.orders, {}
 
     if args.order_file:
-        path = OUTPUT_DIR / args.order_file if "/" not in args.order_file else args.order_file
+        # 绝对路径直接用；否则视为 OUTPUT_DIR 下的相对文件名。
+        # 用 Path.is_absolute() 而不是判断 "/" —— 后者在 Windows 上会漏掉反斜杠。
+        candidate = Path(args.order_file)
+        path = candidate if candidate.is_absolute() else OUTPUT_DIR / args.order_file
         data = json.loads(path.read_text(encoding="utf-8"))
         return data.get("order_numbers", []), data.get("order_issues", {})
 

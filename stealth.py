@@ -25,7 +25,6 @@ from playwright.sync_api import (
     BrowserContext,
     Locator,
     Page,
-    sync_playwright,
 )
 
 
@@ -334,8 +333,25 @@ STEALTH_INIT_SCRIPT = r"""
             var originalToBlob = HTMLCanvasElement.prototype.toBlob;
             var originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
 
+            // 业务自己会用 canvas.toDataURL 读旋转验证码图（见 pdd_chat._extract_captcha_image_bytes），
+            // 若在这些画布上注噪，取回的像素就是被污染的，直接降低旋转角度识别精度。
+            // 用祖先选择器排除验证码/旋转拼图容器内的所有 canvas。
+            var CAPTCHA_ANCESTOR_SELECTOR =
+                '.captcha-wrapper, #slide-captcha-dialog, .rotateslider-img-bg, ' +
+                '.rotateslider-circle, [class*="rotateslider"], [class*="captcha"]';
+
+            var isCaptchaCanvas = function (canvas) {
+                try {
+                    if (!canvas || !canvas.closest) return false;
+                    return canvas.closest(CAPTCHA_ANCESTOR_SELECTOR) !== null;
+                } catch (e) {
+                    return false;
+                }
+            };
+
             var addNoise = function (canvas) {
                 try {
+                    if (isCaptchaCanvas(canvas)) return;
                     var ctx = canvas.getContext('2d');
                     if (!ctx) return;
                     var imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -786,56 +802,4 @@ def random_mouse_wander(
 
 
 # ============================================================
-# 带拟人延迟的清障包装
-# ============================================================
 
-def stealth_safe_click(
-    page: Page,
-    locator: Locator,
-    description: str,
-    timeout: int = 8_000,
-    retries: int = 3,
-) -> None:
-    """
-    带拟人延迟的 safe_click 变体。
-
-    在原有 clear_blockers + click 的基础上，增加了点击前的小随机延迟，
-    让时序模式更接近真人。
-    """
-
-    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
-    last_error: Exception | None = None
-
-    for attempt in range(1, retries + 1):
-        # 模拟看到元素后的反应时间
-        human_delay(80, 250)
-
-        try:
-            locator.click(timeout=timeout)
-            return
-        except PlaywrightTimeoutError as error:
-            last_error = error
-            print(
-                f"点击【{description}】第 {attempt} 次未成功，"
-                "检查是否有弹窗遮挡……"
-            )
-
-    raise RuntimeError(
-        f"点击【{description}】失败：重试 {retries} 次后仍被遮挡或不可点击。"
-    ) from last_error
-
-
-# ============================================================
-# User-Agent 辅助
-# ============================================================
-
-# 常见 Windows Chrome 127+ 的 UA（匹配 2025H2 时间窗口）。
-# 注意：不要在代码里硬写 UA 然后用它来"伪装"，Playwright 自己
-# 生成的 UA 已经是真实的 Chrome UA。这里保留作为参考，以防某些
-# 场景需要传入 user_agent 参数。
-REFERENCE_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/127.0.0.0 Safari/537.36"
-)
