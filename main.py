@@ -21,6 +21,27 @@
 
 from __future__ import annotations
 
+
+def _bootstrap_shop_env() -> None:
+    """从 sys.argv 抓 --shop 写入 os.environ，供 paths.py import 时读取。
+
+    必须在任何 from paths / from pdd_chat 等 import 之前执行——
+    paths.py 在 import 时就固化路径，argparse 里再传就晚了。
+    setdefault 保证如果 env var 已经被外部设置（例如 shell 里
+    `PDDCHAT_SHOP=xxx python ...`）不会被 argv 覆盖。
+    """
+    import os
+    import sys
+
+    if "--shop" in sys.argv:
+        i = sys.argv.index("--shop")
+        if i + 1 < len(sys.argv):
+            os.environ.setdefault("PDDCHAT_SHOP", sys.argv[i + 1])
+
+
+_bootstrap_shop_env()
+
+
 import argparse
 import json
 from datetime import datetime
@@ -39,7 +60,7 @@ from appeal_submit import (
 )
 from captcha import set_auto_solve_captcha
 from login import wait_for_login
-from paths import OUTPUT_DIR, PROFILE_DIR
+from paths import OUTPUT_DIR, PROFILE_DIR, SHOP_ID
 from screenshots import save_error_screenshot
 from run_appeal_batch import (
     collect_all_appealable_order_numbers,
@@ -124,6 +145,14 @@ def parse_args() -> argparse.Namespace:
         "--orders",
         nargs="+",
         help="直接指定订单号，如 --orders 260803-xxx 260802-xxx（用于 Phase 2 或 Phase 3）",
+    )
+    parser.add_argument(
+        "--shop",
+        help=(
+            "店铺 ID。传入后所有目录切到 state/profiles/<shop>/、"
+            "output/<shop>/、debug/<shop>/、evidence/<shop>/；"
+            "不传走单店老路径。实际值已在 import 前被抓走，此处仅供 --help 展示。"
+        ),
     )
     return parser.parse_args()
 
@@ -323,6 +352,9 @@ def run_phase3(
 
 def main() -> None:
     args = parse_args()
+
+    # 启动横幅：多店并行时终端里能一眼看清哪个窗口是哪个店。
+    print(f"[店铺] {SHOP_ID or '(单店铺模式)'}")
 
     # --confirm 隐含 --submit（无需重复指定）
     if args.confirm:

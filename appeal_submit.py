@@ -1,5 +1,20 @@
 from __future__ import annotations
 
+
+def _bootstrap_shop_env() -> None:
+    """从 sys.argv 抓 --shop 写入 os.environ；见 main.py 同名函数说明。"""
+    import os
+    import sys
+
+    if "--shop" in sys.argv:
+        i = sys.argv.index("--shop")
+        if i + 1 < len(sys.argv):
+            os.environ.setdefault("PDDCHAT_SHOP", sys.argv[i + 1])
+
+
+_bootstrap_shop_env()
+
+
 import json
 import re
 from pathlib import Path
