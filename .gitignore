@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# IDE
+.idea/
+.vscode/
+.codebuddy/
+
+# Runtime data (browser profiles, logs, etc.)
+state/
+
+# Runtime artifacts (order data, chat records, evidence screenshots, debug output)
+output/
+evidence/
+debug/
+
+# Misc tooling
+.python-version
+*.log
+*.tmp
