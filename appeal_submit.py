@@ -15,37 +15,43 @@ def _bootstrap_shop_env() -> None:
 _bootstrap_shop_env()
 
 
-import json
 import re
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from playwright.sync_api import (
     BrowserContext,
     Locator,
     Page,
-    TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
+    expect,
+)
+from playwright.sync_api import (
+    TimeoutError as PlaywrightTimeoutError,
 )
 
-from stealth import (
-    create_stealth_context,
-    human_delay,
-    human_type,
-    jitter_wait,
-)
-
+import db
+from blockers import clear_blockers, safe_click, stealth_safe_click
+from captcha import ensure_no_captcha, is_captcha_visible
+from login import get_query_button, raise_if_login_page, wait_for_content_or_login, wait_for_login
 from paths import (
     BASE_DIR,
     DEBUG_DIR,
     EVIDENCE_DIR,
-    OUTPUT_DIR,
     PROFILE_DIR,
+    SHOP_ID,
 )
-from blockers import clear_blockers, safe_click, stealth_safe_click
-from captcha import ensure_no_captcha, is_captcha_visible
-from login import get_query_button, wait_for_login
 from screenshots import safe_filename, save_error_screenshot
-
+from chat_evidence import select_chat_evidence
+from stealth import (
+    business_pause,
+    business_read_page,
+    create_stealth_context,
+    human_delay,
+    paste_text,
+    jitter_wait,
+)
 
 # ============================================================
 # 基础配置
@@ -53,6 +59,15 @@ from screenshots import safe_filename, save_error_screenshot
 
 APPEAL_SEARCH_URL = (
     "https://mms.pinduoduo.com/aftersales/customer_complain_appeal"
+)
+
+
+def _select_chat_evidence(files: list[Path], order: dict | None) -> list[Path]:
+    """三个业务共用一张优先、最多两张的连续原图选择规则。"""
+    return select_chat_evidence(files, order)
+
+APPEALABLE_ORDERS_ENTRY_PATTERN = re.compile(
+    r"^\s*(?:查看可申诉订单|立即申诉)\s*$"
 )
 
 # 默认验证订单号（用户提供的真实示例，本身处于"可申诉"状态）
@@ -94,7 +109,22 @@ APPEAL_REASON_MAP = {
 #         select + textarea + 图片上传，选了下拉才渐进渲染后续字段。
 STATUS_A_TEXT_MARKER = "当前平台未采取实际处理措施"
 STATUS_B_CLASS_MARKER = "detail_confront_new_status"
-STATUS_ALREADY_APPEALED_MARKER = "已申诉"
+
+# 下面这几种状态都是"详情页没有可操作的'我要申诉'入口，只能跳过"——
+# detail_statusName 文本标记 -> 状态码。这类状态的详情页结构都差不多：
+# 只有 detail_subTitle__3Qdjc（"处理状态"）+ detail_statusName__VnpUu
+# （具体文案）[+ 只读的"展开申诉信息"之类的链接]，既没有
+# detail_statusText__2tLhY，也没有 detail_confront_new_status 类，之前
+# 每冒出一种新文案就会落到 detect_detail_page_status 最后的 RuntimeError。
+# 以后再遇到新的终态文案，只需要在这个字典里加一行——不用再改
+# detect_detail_page_status 的其余逻辑，main.py 那边也是查表处理
+# （_process_one_appeal_record 的 _TERMINAL_STATUSES），同样只需要加一行。
+TERMINAL_STATUS_MARKERS: dict[str, str] = {
+    "已申诉": "ALREADY_APPEALED",  # 已经提交过申诉（审核中/结果未知）
+    "超时未申诉": "EXPIRED",       # 从没申诉，窗口已过期，已被处罚
+    "申诉未通过": "REJECTED",      # 申诉过但没通过，已被处罚
+}
+
 STATUS_C_BUTTON_SELECTOR = (
     'div.detail_statusText__2tLhY '
     'button[data-testid="beast-core-button"]'
@@ -107,6 +137,19 @@ STATUS_C_BUTTON_SELECTOR = (
 # 锚点、都是直接弹表单），只能在模态框打开后按 radio 数量+文字识别。
 A2_APPEAL_REASON_GOODS_NO_ISSUE = "商品没有问题"
 A2_APPEAL_REASON_OTHER = "其他"
+
+# 商品问题 A3 变体（赔付类申诉）：申诉表单模态框里 #appealReasonCode 有
+# 3 个 radio（"消费者承认自己误解，商家未发错" / "消费者反馈的非发错货
+# 问题" / "其他"），固定选"其他"；选中"其他"后 #appealNote（申诉说明）
+# 与 #appealEvidenceImages（申诉凭证）才渐进渲染出现，处理方式与 A2
+# 完全一样。这个变体的模态框里还多了一段"仅对赔付款项进行申诉，不涉及
+# 店铺及商品指标"提示和"为什么需要补偿消费者？"折叠面板，只是展示内容，
+# 不需要交互。详情页状态块同样无法区分 A3 与状态 A/A2（三者共用
+# #appealReasonCode 锚点），只能在模态框打开后按 radio 数量+文字识别
+# （3 个），与 A2（2 个）不会混淆。
+A3_APPEAL_REASON_CONSUMER_ADMIT = "消费者承认自己误解，商家未发错"
+A3_APPEAL_REASON_NOT_WRONG_ITEM = "消费者反馈的非发错货问题"
+A3_APPEAL_REASON_OTHER = "其他"
 
 # 申诉相关模态框识别用（仅识别，不用作点击 locator）
 APPEAL_FORM_HEADER_TEXT = "发起申诉"
@@ -145,6 +188,21 @@ APPEAL_NOTICE_CONFIRM_TEXT = "确认并提交"
 def open_appeal_search_page(page: Page) -> None:
     """进入拼多多客诉申诉搜索页（按订单编号搜索的入口）。"""
 
+    # 批量申诉为每家店铺保留一个专用申诉标签页。上一单处理完成后，
+    # 这个页面通常仍停留在搜索列表；控件也可用时直接复用，避免每一单
+    # 都重新 goto、等待整页资源加载。详情页路径同样包含下面的 URL，
+    # 因此不能只看地址，必须同时确认订单搜索框已经可见。
+    if "/aftersales/customer_complain_appeal" in page.url and "/detail" not in page.url:
+        try:
+            get_order_sn_input(page).wait_for(state="visible", timeout=1_500)
+        except PlaywrightTimeoutError:
+            pass
+        else:
+            raise_if_login_page(page)
+            clear_blockers(page)
+            print("复用已打开的客诉申诉搜索页。")
+            return
+
     print("正在进入客诉申诉搜索页……")
 
     try:
@@ -159,23 +217,23 @@ def open_appeal_search_page(page: Page) -> None:
         # goto 超时不一定表示页面完全打不开。
         print("页面导航超过 60 秒，继续检查页面内容。")
 
+    raise_if_login_page(page)
+
     # 给风控弹窗留出注入时间再检查
     jitter_wait(page, 1_500)
 
     clear_blockers(page)
 
-    get_order_sn_input(page).wait_for(
-        state="visible",
-        timeout=30_000,
-    )
+    wait_for_content_or_login(page, get_order_sn_input(page), timeout=30_000)
 
     print("客诉申诉搜索页已就绪。")
+    business_read_page(page)
 
 
 def get_order_sn_input(page: Page) -> Locator:
     """获取订单编号搜索框。"""
 
-    return page.get_by_placeholder("请输入完整订单编号")
+    return page.get_by_placeholder("请输入完整订单编号", exact=True).filter(visible=True)
 
 
 def fill_appeal_search_order_no(
@@ -196,9 +254,11 @@ def fill_appeal_search_order_no(
         timeout=20_000,
     )
 
-    # 用模拟真人逐键输入替代 order_input.fill(order_no)
-    # .fill() 是瞬间完成的，不产生 keydown/keyup 事件，易被风控识别
-    human_type(page, order_input, order_no)
+    # 直接通过目标输入框替换上一单的值，并触发 input 事件。
+    # 不再重复坐标点击或用 page.keyboard 逐字输入，避免点击偏移、
+    # 页面重排或输入事件切换焦点后，把订单号打到顶部全局搜索框。
+    business_pause(page)
+    order_input.fill(order_no, timeout=20_000)
 
     current_value = order_input.input_value()
 
@@ -249,8 +309,17 @@ def get_search_result_signature(page: Page) -> str:
 def wait_for_search_result_updated(
     page: Page,
     previous_signature: str,
+    timeout_ms: int = 20_000,
 ) -> bool:
-    """等待搜索结果表格内容相对 previous_signature 发生变化。"""
+    """等待搜索结果表格内容相对 previous_signature 发生变化。
+
+    timeout_ms 按调用场景调节：
+    - search_appeal_order 按订单号搜索这一步传短一点的值——这一步等不到
+      变化，大概率意味着这个订单号在"按号搜索"这条路径下就是找不到，
+      早点判定失败、早点走查看可申诉订单兜底，不用死等满超时。
+    - _click_view_appealable_orders 点开的是可申诉订单全量列表，条数
+      可能更多、渲染更慢，继续用默认的 20 秒，不跟着一起缩短。
+    """
 
     try:
         page.wait_for_function(
@@ -280,8 +349,8 @@ def wait_for_search_result_updated(
             }
             """,
             arg=previous_signature,
-            timeout=20_000,
-        )
+            timeout=timeout_ms,
+        ).dispose()
 
         jitter_wait(page, 500)
 
@@ -322,12 +391,16 @@ def search_appeal_order(
     # 点击查询会触发后端请求，是验证码高发时机
     clear_blockers(page)
 
+    # 按订单号搜索这一步原来等 20 秒，实测太慢——这一步等不到变化
+    # 通常就是意味着按号搜索找不到，缩到 5 秒，尽快转去
+    # search_and_get_rows 里"查看可申诉订单"那条兜底路径。
     if not wait_for_search_result_updated(
         page=page,
         previous_signature=previous_signature,
+        timeout_ms=5_000,
     ):
         print(
-            "点击查询后 20 秒内没有检测到结果变化，"
+            "点击查询后 5 秒内没有检测到结果变化，"
             "继续尝试读取当前页面结果。"
         )
 
@@ -336,17 +409,17 @@ def search_appeal_order(
 # 查看详情：定位链接、捕获新开页面
 # ============================================================
 
-def get_view_detail_link(
+def get_result_rows(
     page: Page,
     order_no: str,
 ) -> Locator:
     """
-    获取指定订单那一行里的"查看详情"链接。
+    获取搜索结果表格里，指定订单号匹配到的所有行。
 
-    先按订单编号定位到对应的 <tr>，再在这一行内查找"查看详情"，
-    因为同一行里"问题类型"列还有一个"查看历史整改建议"链接，
-    两者选择器完全相同（data-testid="beast-core-button-link"），
-    必须靠文字区分，否则可能点错。
+    同一个订单号在拼多多那边可能对应不止一条独立的"消费者负向体验"
+    记录（商品问题一条、服务问题一条，甚至同一问题类型也可能不止一条）
+    ——这里返回所有匹配的行，数量可能是 0、1 或更多，由调用方决定怎么
+    逐条处理，不在这里假设只有一行。
     """
 
     # 用正则 + 负向环视避免子串误命中：如果 PDD 表格里同时有
@@ -356,20 +429,77 @@ def get_view_detail_link(
     order_no_pattern = re.compile(
         rf"(?<![\d\-]){re.escape(order_no)}(?![\d\-])"
     )
-    row = page.locator(
+    return page.locator(
         'tbody[data-testid="beast-core-table-middle-tbody"] tr'
     ).filter(has_text=order_no_pattern)
 
+
+def get_row_detail_link(row: Locator) -> Locator:
+    """
+    获取某一行里的"查看详情"链接。
+
+    同一行里"问题类型"列还有一个"查看历史整改建议"链接，两者选择器
+    完全相同（data-testid="beast-core-button-link"），必须靠文字区分，
+    否则可能点错。
+    """
     return row.locator(
         'a[data-testid="beast-core-button-link"]'
     ).filter(has_text="查看详情")
 
 
+# "问题类型"列的 cell 索引，跟 run_appeal_batch.py 的
+# extract_order_info_from_current_page() 用同一个约定（cells[2]）——
+# 两处理论上是同一套表格组件渲染出来的，但还没有实测确认申诉搜索结果页
+# 的列顺序是否跟"可申诉订单"列表页完全一致，需要实跑确认。
+_ISSUE_TYPE_CELL_INDEX = 2
+
+# 申诉记录的"创建时间"一般精确到秒，两条记录撞上同一秒的概率可以忽略，
+# 用来当一条记录的稳定标识——不依赖知道具体是第几列，只要行文本里出现
+# 这种格式的子串就能抓到。
+_TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+
+
+def get_row_issue_type(row: Locator) -> str:
+    """
+    获取某一行的"问题类型"列文本（比如"商品问题"/"服务问题"）。
+
+    直接从这一行读，不依赖采集阶段（run_appeal_batch.py）传下来的
+    order_issues 字典——那个字典按订单号存，一个订单号有多条记录时存不下
+    每条各自的问题类型，这里才是权威来源。取不到就返回空字符串，不影响
+    主流程（上层会退回用采集阶段的值兜底）。
+    """
+    try:
+        cells = row.locator('td[data-testid="beast-core-table-td"]')
+        if cells.count() <= _ISSUE_TYPE_CELL_INDEX:
+            return ""
+        return (cells.nth(_ISSUE_TYPE_CELL_INDEX).inner_text() or "").strip()
+    except Exception:
+        return ""
+
+
+def get_row_record_key(row: Locator) -> str:
+    """
+    从这一行的完整文本里提取一个能稳定标识"这条记录"的字符串。
+
+    优先找形如 "2026-08-13 19:16:04" 的时间戳（申诉记录的"创建时间"列）。
+    找不到就退化成整行文本本身——仍然能在同一次循环内正确去重（不会重复
+    处理同一行），但如果整行文本包含"剩 X 天 X 时"这种会随时间变化的倒计
+    时文字，就没法跨进程/跨次运行稳定识别成同一条记录，只是退化效果，
+    不是错误，需要实跑确认时间戳能不能稳定提取到。
+    """
+    text = row.inner_text()
+    match = _TIMESTAMP_PATTERN.search(text)
+    if match:
+        return match.group(0)
+    return text.strip()
+
+
 def _click_view_appealable_orders(page: Page) -> bool:
-    """点击搜索页统计区的"查看可申诉订单"，等待表格数据刷新。
+    """点击搜索页统计区的可申诉订单入口，等待表格数据刷新。
 
     场景：按订单编号查询后没找到"查看详情"（表格显示"暂无申诉记录"），
-    页面顶部统计区会有"可申诉订单数 N 单"和"查看可申诉订单"入口，
+    页面顶部统计区会有“可申诉订单数 N 单”，入口文字可能是
+    “查看可申诉订单”或“立即申诉”，
     点击后会在当前页切换/刷新出可申诉订单列表，再从中定位该订单的
     "查看详情"。
 
@@ -379,7 +509,7 @@ def _click_view_appealable_orders(page: Page) -> bool:
     link = page.locator(
         'a[data-testid="beast-core-button-link"]'
     ).filter(
-        has_text="查看可申诉订单"
+        has_text=APPEALABLE_ORDERS_ENTRY_PATTERN
     )
 
     try:
@@ -388,10 +518,10 @@ def _click_view_appealable_orders(page: Page) -> bool:
             timeout=8_000,
         )
     except PlaywrightTimeoutError:
-        print("当前页面没有「查看可申诉订单」入口。")
+        print("当前页面没有「查看可申诉订单/立即申诉」入口。")
         return False
 
-    print("正在点击「查看可申诉订单」……")
+    print("正在点击可申诉订单入口……")
 
     # 点击前记下当前表格签名，点击后等待它变化
     before_signature = get_search_result_signature(page)
@@ -401,7 +531,7 @@ def _click_view_appealable_orders(page: Page) -> bool:
     safe_click(
         page=page,
         locator=link,
-        description="查看可申诉订单",
+        description="查看可申诉订单/立即申诉",
     )
 
     wait_for_search_result_updated(
@@ -413,52 +543,19 @@ def _click_view_appealable_orders(page: Page) -> bool:
     return True
 
 
-def open_appeal_detail_page(
+def open_row_detail_page(
     context: BrowserContext,
     page: Page,
+    detail_link: Locator,
     order_no: str,
-) -> Page | None:
-    """点击搜索结果中的"查看详情"，捕获随之新开的页面并返回。
+) -> Page:
+    """点击某一行的"查看详情"，捕获随之新开的页面并返回。
 
-    若查询后没找到"查看详情"（表格显示"暂无申诉记录"），会先点击
-    "查看可申诉订单"再找一次；仍找不到则返回 None，表示该订单
-    没有可申诉记录（由调用方决定跳过，不抛异常）。
+    只负责"点击、捕获新页面"这一个动作——调用方负责确认 detail_link
+    确实可见/可点，以及"这个订单号一共有几行、要不要先点查看可申诉订单
+    兜底、逐行怎么循环"这些编排逻辑（因为一个订单号可能对应不止一条
+    记录，编排逻辑上移到调用方 main.py 的 submit_single_order）。
     """
-
-    detail_link = get_view_detail_link(page, order_no)
-
-    try:
-        detail_link.wait_for(
-            state="visible",
-            timeout=5_000,
-        )
-    except PlaywrightTimeoutError:
-        print(
-            f"订单 {order_no} 查询后未找到「查看详情」"
-            "（表格可能显示暂无申诉记录），尝试点击「查看可申诉订单」……"
-        )
-
-        if not _click_view_appealable_orders(page):
-            print(f"订单 {order_no} 视为找不到申诉记录。")
-            return None
-
-        try:
-            detail_link.wait_for(
-                state="visible",
-                timeout=5_000,
-            )
-        except PlaywrightTimeoutError:
-            print(
-                f"订单 {order_no} 点击「查看可申诉订单」后仍无「查看详情」，"
-                "视为找不到申诉记录。"
-            )
-            return None
-
-    if detail_link.count() != 1:
-        raise RuntimeError(
-            f"订单 {order_no} 对应的「查看详情」链接数量异常："
-            f"{detail_link.count()}"
-        )
 
     print(f"正在点击订单 {order_no} 的查看详情……")
 
@@ -478,6 +575,13 @@ def open_appeal_detail_page(
 
     print(f"已打开新页面：{detail_page.url}")
 
+    ticket_sn = extract_ticket_sn_from_url(detail_page.url)
+    if ticket_sn:
+        db.record_ticket_sn(SHOP_ID or "default", order_no, ticket_sn)
+        print(f"已记录订单 {order_no} 的 ticketSn：{ticket_sn}")
+    else:
+        print(f"订单 {order_no} 的详情页 URL 中未找到 ticketSn。")
+
     # 实测这个新开的详情页正是验证码高发的位置，
     # 而且要检查的是新页面本身，不是原来的搜索页。
     jitter_wait(detail_page, 1_500)
@@ -487,29 +591,84 @@ def open_appeal_detail_page(
     return detail_page
 
 
+def extract_ticket_sn_from_url(url: str) -> str:
+    """从申诉详情页 URL 查询参数中提取 ticketSn。"""
+    values = parse_qs(urlsplit(url).query).get("ticketSn", [])
+    if not values:
+        return ""
+    # 正常页面 URL 不带标点；额外去掉复制链接时容易附带的中英文逗号。
+    return values[0].strip().rstrip(",，")
+
+
+def search_and_get_rows(page: Page, order_no: str) -> Locator:
+    """按订单编号搜索，返回匹配到的所有结果行（可能是 0 行、1 行或多行）。
+
+    若查询后一行都没找到（表格显示"暂无申诉记录"），会先点击"查看可
+    申诉订单"再找一次——这个兜底逻辑只在完全没有匹配行时触发一次，不是
+    针对某一行。返回的 Locator 数量交给调用方判断："找不到申诉记录"
+    （0 行）还是要逐行处理（1 行或更多）。
+    """
+
+    search_appeal_order(page, order_no)
+
+    rows = get_result_rows(page, order_no)
+
+    # 这一步原来等 5 秒，缩到 3 秒——search_appeal_order 那边已经等过
+    # 表格刷新了，这里只是在刷新完的表格里确认「查看详情」渲染出来，
+    # 用不着再等那么久；等不到就尽快转去下面的可申诉订单入口兜底。
+    try:
+        get_row_detail_link(rows.first).wait_for(state="visible", timeout=3_000)
+        return rows
+    except PlaywrightTimeoutError:
+        print(
+            f"订单 {order_no} 查询后未找到「查看详情」"
+            "（表格可能显示暂无申诉记录），尝试点击可申诉订单入口……"
+        )
+
+        if not _click_view_appealable_orders(page):
+            return rows  # count() 会是 0，调用方据此判断"找不到申诉记录"
+
+        rows = get_result_rows(page, order_no)
+        try:
+            get_row_detail_link(rows.first).wait_for(state="visible", timeout=5_000)
+        except PlaywrightTimeoutError:
+            print(
+                f"订单 {order_no} 点击可申诉订单入口后仍无「查看详情」，"
+                "视为找不到申诉记录。"
+            )
+        return rows
+
+
 def search_and_open_appeal_detail(
     context: BrowserContext,
     page: Page,
     order_no: str,
 ) -> Page | None:
     """
-    按订单编号搜索并打开对应的申诉详情页（新开的页面）。
+    按订单编号搜索并打开**第一条**匹配记录的申诉详情页（新开的页面）。
 
-    若查询后没找到"查看详情"（表格显示"暂无申诉记录"），会先点击
-    "查看可申诉订单"再找一次；仍找不到则返回 None，表示该订单
-    没有可申诉记录（由调用方决定跳过）。
-
-    这是对外的主入口：未来 run_appeal_batch.py 批量处理已分析订单
-    时，会对每个订单号依次调用这个函数。
+    找不到任何记录时返回 None。如果这个订单号对应不止一条记录，只打开
+    第一条并打印提示——这个函数保留给 appeal_submit.py 自己的单订单人工
+    调试入口（main()）用，人工调试场景一次看一条就够；批量流水线不用
+    这个函数，main.py 的 submit_single_order 直接用 search_and_get_rows
+    逐条处理所有记录。
     """
 
-    search_appeal_order(page, order_no)
+    rows = search_and_get_rows(page, order_no)
+    count = rows.count()
 
-    return open_appeal_detail_page(
-        context=context,
-        page=page,
-        order_no=order_no,
-    )
+    if count == 0:
+        print(f"订单 {order_no} 视为找不到申诉记录。")
+        return None
+
+    if count > 1:
+        print(
+            f"订单 {order_no} 查到 {count} 条记录，人工调试入口只打开第一条"
+            "（批量流水线会逐条处理，见 main.py submit_single_order）。"
+        )
+
+    detail_link = get_row_detail_link(rows.first)
+    return open_row_detail_page(context, page, detail_link, order_no)
 
 
 # ============================================================
@@ -521,9 +680,8 @@ def collect_evidence_files(order_no: str) -> list[Path]:
     收集指定订单的申诉凭证截图。
 
     搜索策略（按优先级）：
-    1. output/chat_<safe_order_no>.json 里的 evidence_screenshots
-       字段——这是 pdd_chat.py 抓聊天记录时写入的权威截图清单，
-       路径按项目根 BASE_DIR 相对存放。
+    1. 数据库里这个订单的 evidence_paths 字段——pdd_chat.py 抓聊天记录时
+       算出的权威截图清单，路径按项目根 BASE_DIR 相对存放。
     2. 回退：evidence/<safe_order_no>/ 子目录下所有 .png。
     3. 回退：evidence/<safe_order_no>*.png 平铺文件。
 
@@ -532,37 +690,36 @@ def collect_evidence_files(order_no: str) -> list[Path]:
     """
 
     name = safe_filename(order_no)
+    shop = SHOP_ID or "default"
 
-    # 1) chat json 里的 evidence_screenshots
-    json_path = OUTPUT_DIR / f"chat_{name}.json"
-    if json_path.exists():
-        try:
-            data = json.loads(json_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            data = {}
-
-        screenshots = data.get("evidence_screenshots") or []
+    # 1) 数据库里的 evidence_paths
+    order = db.get_order(shop, order_no)
+    if order is not None:
+        screenshots = order.get("evidence_paths") or []
         files = [BASE_DIR / rel_path for rel_path in screenshots]
         files = [p for p in files if p.is_file()]
         if files:
-            return files
+            return _select_chat_evidence(files, order)
 
     # 2) evidence/<name>/ 子目录
     evidence_dir = EVIDENCE_DIR / name
     if evidence_dir.is_dir():
         files = sorted(evidence_dir.glob("*.png"))
         if files:
-            return files
+            return _select_chat_evidence(files, order)
 
     # 3) 平铺文件
-    return sorted([
+    files = sorted([
         p for p in EVIDENCE_DIR.glob(f"{name}*.png")
         if p.is_file()
     ])
+    return _select_chat_evidence(files, order)
 
 
 def detect_detail_page_status(detail_page: Page) -> str:
-    """判断当前申诉详情页处理状态属于 "A"、"B"、"C" 还是 "ALREADY_APPEALED"。
+    """判断当前申诉详情页处理状态属于 "A"、"B"、"C"，还是
+    TERMINAL_STATUS_MARKERS 里登记的某种"没有可操作入口、只能跳过"的终态
+    （目前有 "ALREADY_APPEALED"/"EXPIRED"/"REJECTED"）。
 
     通过多处锚点交叉判断：
 
@@ -575,7 +732,9 @@ def detect_detail_page_status(detail_page: Page) -> str:
       detail_status__2shmG 里，则为 B；
     - 若 class 锚点均不匹配但文本中出现"我要申诉"（如带倒计时
       的可申诉判定页，CSS 哈希可能不同），则通过 DOM 结构回退
-      判断 B/C，不直接抛错。
+      判断 B/C，不直接抛错；
+    - detail_statusName 文本命中 TERMINAL_STATUS_MARKERS 里任意一个
+      标记，直接返回对应状态码——这些详情页没有"我要申诉"入口了。
 
     三处锚点交叉校验仍冲突时抛 RuntimeError，绝不静默猜测。
     """
@@ -609,9 +768,11 @@ def detect_detail_page_status(detail_page: Page) -> str:
     has_a_marker = STATUS_A_TEXT_MARKER in text_content
     has_b_marker = STATUS_B_CLASS_MARKER in class_list
 
-    # "已申诉"状态（详情页显示"已申诉"+"申诉详情"按钮，无需再模拟）
-    if STATUS_ALREADY_APPEALED_MARKER in full_status_text:
-        return "ALREADY_APPEALED"
+    # 终态标记查表：已申诉/已超时/已驳回……这些详情页都没有"我要申诉"
+    # 入口了，直接按标记返回对应状态码，调用方一律跳过、不填表。
+    for marker, status_code in TERMINAL_STATUS_MARKERS.items():
+        if marker in full_status_text:
+            return status_code
 
     if has_a_marker and not has_b_marker:
         return "A"
@@ -727,6 +888,7 @@ def click_appeal_button_c(context: BrowserContext, page: Page) -> Page:
     human_delay(100, 300)
 
     with context.expect_page() as new_page_info:
+        business_pause(page)
         button.click()
 
     form_page = new_page_info.value
@@ -756,6 +918,7 @@ def wait_for_appeal_form_page(form_page: Page) -> None:
         timeout=30_000,
     )
     print("状态 C 申诉表单页面已就绪。")
+    business_pause(form_page, reading=True)
 
 
 def select_appeal_reason_dropdown(
@@ -872,6 +1035,39 @@ def is_status_a2_modal(modal: Locator) -> bool:
     return texts == [
         A2_APPEAL_REASON_GOODS_NO_ISSUE,
         A2_APPEAL_REASON_OTHER,
+    ]
+
+
+# ============================================================
+# 商品问题 A3 变体（赔付类申诉）：模态框识别
+# ============================================================
+
+def is_status_a3_modal(modal: Locator) -> bool:
+    """判断模态框是否为"商品问题 A3 变体"（赔付类申诉）。
+
+    商品问题还有一种赔付类状态：点"我要申诉"直接弹出表单模态框（同状态
+    A），但 #appealReasonCode 里只有 3 个 radio——"消费者承认自己误解，
+    商家未发错" / "消费者反馈的非发错货问题" / "其他"，且必须选"其他"后
+    #appealNote（申诉说明）与 #appealEvidenceImages（申诉凭证）才渐进
+    渲染出现。识别方式与 is_status_a2_modal 同理：详情页状态块无法区分
+    A3 与状态 A/A2（都共用 #appealReasonCode 锚点），只能在模态框打开后
+    用 radio 数量（3 个，与 A2 的 2 个、状态 A 的 5 个都不同）+ 文字识别。
+
+    返回 True 表示是 A3 变体。
+    """
+
+    radios = modal.locator(
+        '#appealReasonCode label[data-testid="beast-core-radio"]'
+    )
+
+    if radios.count() != 3:
+        return False
+
+    texts = [r.inner_text().strip() for r in radios.all()]
+    return texts == [
+        A3_APPEAL_REASON_CONSUMER_ADMIT,
+        A3_APPEAL_REASON_NOT_WRONG_ITEM,
+        A3_APPEAL_REASON_OTHER,
     ]
 
 
@@ -1013,6 +1209,20 @@ def wait_for_appeal_modal(page: Page, status: str) -> Locator:
     return modal
 
 
+def _save_form_operation_failure(page, modal, field):
+    prefix = DEBUG_DIR / ("form_operation_" + safe_filename(field) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    for suffix, capture in (
+        (".png", lambda: page.screenshot(timeout=3000)),
+        (".html", lambda: modal.evaluate("el => el.outerHTML").encode("utf-8")),
+    ):
+        try:
+            prefix.with_suffix(suffix).write_bytes(capture())
+        except Exception as exc:
+            print(f"表单诊断保存失败：{exc}")
+    print(f"表单操作失败诊断：{prefix}")
+
+
 def select_form_radio(
     page: Page,
     modal: Locator,
@@ -1058,18 +1268,21 @@ def select_form_radio(
             f"文字={radio_text!r}，匹配数量={radio.count()}"
         )
 
-    stealth_safe_click(
-        page=page,
-        locator=radio,
-        description=f"#{form_item_id} 单选：{radio_text}",
-    )
-
-    checked = radio.get_attribute("data-checked")
-    if checked != "true":
-        raise RuntimeError(
-            f"radio 点击后未选中：form-item=#{form_item_id}，"
-            f"文字={radio_text!r}，data-checked={checked!r}"
-        )
+    last_error = None
+    for attempt in range(1, 4):
+        ensure_no_captcha(page)
+        try:
+            # Locator 每次操作重新解析 DOM，并检查目标稳定、可接收点击。
+            if radio.get_attribute("data-checked", timeout=3000) != "true":
+                radio.click(timeout=5000)
+            expect(radio).to_have_attribute("data-checked", "true", timeout=3000)
+            break
+        except (PlaywrightTimeoutError, AssertionError) as exc:
+            last_error = exc
+            print(f"单选项第 {attempt}/3 次未确认选中：{radio_text}")
+    else:
+        _save_form_operation_failure(page, modal, form_item_id)
+        raise RuntimeError(f"radio 点击后未选中（已重试3次）：form-item=#{form_item_id}，文字={radio_text!r}") from last_error
 
     print(f"已选择 #{form_item_id}：{radio_text}")
 
@@ -1111,17 +1324,9 @@ def fill_appeal_note(
     form_item_id: str = "appealNote",
     use_human_type: bool = True,
 ) -> None:
-    """在申诉说明 textarea 里填入申诉文案。
+    """粘贴申诉文案并读回校验；所有场景和重试均使用粘贴。
 
-    以 form_item_id 为根定位 textarea，避免匹配到页面其它组件
-    的同类元素。填完读回 input_value 校验。
-
-    - A/B 场景：form_item_id 为 "appealNote"（模态框内），用拟人打字
-    - C 场景：form_item_id 为 "appealDescription"（独立页面内），
-      用 fill() 直接写入（避免 keyboard.type 触发页面事件导致异常）
-
-    参数:
-        use_human_type: True 拟人逐字打字，False 用 fill() 直接写入
+    use_human_type 保留供旧调用兼容，不再改变输入方式。
     """
 
     textarea = modal.locator(
@@ -1133,24 +1338,22 @@ def fill_appeal_note(
         timeout=10_000,
     )
 
-    if use_human_type:
-        human_type(page, textarea, text)
+    last_error = None
+    for attempt in range(1, 4):
+        ensure_no_captcha(page)
+        try:
+            expect(textarea).to_be_editable(timeout=5000)
+            textarea.click(timeout=5000)
+            expect(textarea).to_be_focused(timeout=2000)
+            paste_text(page, textarea, text)
+            expect(textarea).to_have_value(text, timeout=3000)
+            break
+        except (PlaywrightTimeoutError, AssertionError) as exc:
+            last_error = exc
+            print(f"申诉说明第 {attempt}/3 次填写未通过校验，将重新粘贴")
     else:
-        # C 场景：独立页面的 textarea 可能有 input 事件处理器，
-        # keyboard.type() 逐字触发事件可能导致意外导航/弹窗。
-        # fill() 直接设置值，只触发一次 change 事件，更安全。
-        textarea.click()
-        human_delay(100, 300)
-        textarea.fill(text)
-        human_delay(100, 300)
-
-    current = textarea.input_value()
-    if current != text:
-        raise RuntimeError(
-            "申诉说明填写内容与预期不一致：\n"
-            f"  期望：{text!r}\n"
-            f"  实际：{current!r}"
-        )
+        _save_form_operation_failure(page, modal, form_item_id)
+        raise RuntimeError("申诉说明填写内容与预期不一致或输入框不可操作（已重试3次），未提交") from last_error
 
     print(f"已填写申诉说明（{len(text)} 字）")
 
@@ -1221,24 +1424,25 @@ def upload_evidence_images(
             "超过上限 3 张，只取前 3 张。"
         )
 
+    business_pause(page, reading=True)
     paths_str = [str(p.resolve()) for p in paths]
 
-    # 上传 input 可能是 non-multiple（不带 multiple 属性），此时
-    # set_input_files 一次只能接受 1 个文件。PDD 上传组件是"逐个选择
-    # 追加"模式：每次 change 事件把新文件追加进已选列表并清空 input
-    # value，因此对每个文件分别 set_input_files 即可传多张图。
-    multiple = file_input.get_attribute("multiple")
-    if multiple is not None:
+    # non-multiple 控件逐张追加；multiple 控件一次传入全部文件。
+    if file_input.get_attribute("multiple") is not None:
         file_input.set_input_files(paths_str)
     else:
         for single in paths_str:
+            business_pause(page)
             file_input.set_input_files(single)
 
     # 等容器里出现对应数量的缩略图作为上传完成信号。
     # A：容器里本来有 1 个"示例"占位 thumbnail，期望 uploaded+1；
     # B：没有占位，期望 uploaded；
     # C（example_thumbnail_count=None）：MmsUiMmsUpload 组件没有
-    #   beast-core-thumbnail，跳过等待。
+    #   beast-core-thumbnail，这里跳过——但不代表 C 完全不校验上传完成，
+    #   调用方 fill_appeal_form_status_c 在这个函数返回后会额外调用
+    #   wait_for_status_c_evidence_uploaded，靠"存在未上传完成的凭证"
+    #   这段提示文字的可见性来判断。
     # 拼多多图片上传是异步走 HTTP，一般几秒内完成；超时不硬失败，
     # 打个警告让人工在页面上确认。
     if example_thumbnail_count is not None:
@@ -1259,7 +1463,7 @@ def upload_evidence_images(
                     "exampleCount": example_thumbnail_count,
                 },
                 timeout=30_000,
-            )
+            ).dispose()
         except PlaywrightTimeoutError:
             print(
                 f"警告：等待 {len(paths)} 张凭证上传完成超时"
@@ -1271,6 +1475,48 @@ def upload_evidence_images(
         f"已提交 {len(paths)} 张申诉凭证截图待上传"
         f"（容器=#{container_id}）。"
     )
+
+
+# 状态 C 专用："存在未上传完成的凭证"提示文字（红色，出现在凭证上传区
+# 下方）。C 用的 MmsUiMmsUpload 组件没有 beast-core-thumbnail 缩略图，
+# 没法像 A/B 那样靠缩略图数量判断上传是否完成，但页面在有凭证还没传完时
+# 会显式展示这段提示，上传全部完成后它会消失——可以拿它的可见性当完成
+# 信号（用户截图实测确认过：上传中缩略图带进度条时这行提示存在）。
+STATUS_C_UPLOAD_INCOMPLETE_TEXT = "存在未上传完成的凭证"
+
+
+def wait_for_status_c_evidence_uploaded(
+    page: Page,
+    timeout_ms: int = 30_000,
+) -> None:
+    """状态 C 专用：等待"存在未上传完成的凭证"提示消失，作为凭证上传
+    完成的信号，取代之前"跳过等待、靠固定 jitter_wait 赌运气"的做法。
+
+    分两步等：
+    1. 先给这段提示最多 3 秒时间"出现"——确认页面确实进入了"有凭证未
+       完成"的中间态，属于正常现象（上传是异步 HTTP，图片较大或网络慢
+       时会经过这个状态）。等不到不算异常：可能上传本来就很快，代码
+       跑到这里之前已经完成，压根没经过这个中间态，直接进第 2 步。
+    2. 再等这段提示变为不可见（初始就不可见的话立刻通过）。超时不硬
+       失败，只打印警告——延续 upload_evidence_images 里 A/B 分支同样
+       "软超时、交给人工确认"的处理方式，不确定的失败不应该让整个批次
+       中断。
+    """
+    warning = page.get_by_text(STATUS_C_UPLOAD_INCOMPLETE_TEXT).first
+
+    try:
+        warning.wait_for(state="visible", timeout=3_000)
+    except PlaywrightTimeoutError:
+        pass  # 可能上传已经很快完成，没能捕捉到这个中间态，不算异常
+
+    try:
+        warning.wait_for(state="hidden", timeout=timeout_ms)
+        print(f"状态 C：凭证上传完成（'{STATUS_C_UPLOAD_INCOMPLETE_TEXT}'提示已消失）。")
+    except PlaywrightTimeoutError:
+        print(
+            f"警告：状态 C 等待'{STATUS_C_UPLOAD_INCOMPLETE_TEXT}'提示"
+            "消失超时，上传可能仍在进行，请人工在页面上确认。"
+        )
 
 
 def fill_appeal_form_status_a(
@@ -1324,6 +1570,46 @@ def fill_appeal_form_status_a2(
         modal=modal,
         form_item_id="appealReasonCode",
         radio_text=A2_APPEAL_REASON_OTHER,
+    )
+    # 选"其他"后 #appealNote / #appealEvidenceImages 渐进渲染，
+    # fill_appeal_note / upload_evidence_images 内部 wait 会兜住时序。
+    fill_appeal_note(page, modal, appeal_text)
+    upload_evidence_images(
+        page=page,
+        modal=modal,
+        file_paths=evidence_files,
+        container_id=APPEAL_IMAGE_CONTAINER_A,
+        example_thumbnail_count=0,
+    )
+
+
+def fill_appeal_form_status_a3(
+    page: Page,
+    modal: Locator,
+    appeal_text: str,
+    evidence_files: list[Path],
+) -> None:
+    """商品问题 A3 变体（赔付类申诉）表单填写：固定选"其他" → 说明 → 上传。
+
+    与 A2 处理方式完全一样，唯一区别是 #appealReasonCode 的 radio
+    有 3 个选项（"消费者承认自己误解，商家未发错" / "消费者反馈的非发
+    错货问题" / "其他"），用户要求固定选"其他"。选中"其他"后
+    #appealNote（申诉说明）与 #appealEvidenceImages（申诉凭证）才
+    渐进渲染出现：
+
+      1. 先固定选"其他"（触发渐进渲染）
+      2. 再填 #appealNote、上传 #appealEvidenceImages
+
+    上传容器与 A/A2 相同（#appealEvidenceImages），同样没有"示例"
+    占位缩略图，所以 example_thumbnail_count=0。模态框里额外的赔付
+    提示文案和"为什么需要补偿消费者？"折叠面板不影响填表，无需处理。
+    """
+
+    select_form_radio(
+        page=page,
+        modal=modal,
+        form_item_id="appealReasonCode",
+        radio_text=A3_APPEAL_REASON_OTHER,
     )
     # 选"其他"后 #appealNote / #appealEvidenceImages 渐进渲染，
     # fill_appeal_note / upload_evidence_images 内部 wait 会兜住时序。
@@ -1469,16 +1755,18 @@ def fill_appeal_form_status_c(
     print("状态 C：开始填写申诉表单……")
 
     # 1. 填写申诉描述
-    print("状态 C：正在填写申诉描述……")
+    # 改用拟人逐字打字（跟 A/B 一致）——原先这里用 fill() 是担心独立页面的
+    # 独立页面申诉文案同样使用剪贴板粘贴。
     fill_appeal_note(
         page,
         page,
         appeal_text,
         form_item_id="appealDescription",
-        use_human_type=False,
+        use_human_type=True,
     )
 
-    # 2. 上传凭证截图（C 没有缩略图，跳过等待）
+    # 2. 上传凭证截图（C 没有缩略图，靠"存在未上传完成的凭证"提示判断
+    #    是否传完，见 wait_for_status_c_evidence_uploaded）
     print(f"状态 C：正在上传 {len(evidence_files)} 张凭证……")
     upload_evidence_images(
         page=page,
@@ -1488,7 +1776,9 @@ def fill_appeal_form_status_c(
         example_thumbnail_count=None,
     )
 
-    jitter_wait(page, 1_000)
+    wait_for_status_c_evidence_uploaded(page)
+
+    jitter_wait(page, 500)
 
     # 校验底部"提交申请"按钮是否可见（确认表单完整渲染 + 选择已生效）
     if submit_button.count() != 1 or not submit_button.is_visible():
@@ -1514,7 +1804,7 @@ def fill_appeal_modal(
     调用方需要在调用本函数前已处在订单的申诉详情页上。
     issue_type: "商品问题"/"服务问题"，控制表单处理分支（当前仅支持商品问题）。
 
-    顶层负责分流（含 A/B/C 三种状态 + 商品问题 A2 变体）：
+    顶层负责分流（含 A/B/C 三种状态 + 商品问题 A2/A3 变体）：
 
     A/B（模态框）：
     1. 前置校验分类合法、凭证图片存在；
@@ -1694,7 +1984,21 @@ def fill_appeal_modal(
                 "商品问题 A2 变体：申诉原因仅'商品没有问题/其他'，"
                 "固定选'其他'。"
             )
+            status = "A2"
             fill_appeal_form_status_a2(
+                page=page,
+                modal=modal,
+                appeal_text=appeal_text,
+                evidence_files=evidence_files,
+            )
+        elif is_status_a3_modal(modal):
+            print(
+                "商品问题 A3 变体（赔付类申诉）：申诉原因为'消费者承认"
+                "自己误解，商家未发错/消费者反馈的非发错货问题/其他'，"
+                "固定选'其他'。"
+            )
+            status = "A3"
+            fill_appeal_form_status_a3(
                 page=page,
                 modal=modal,
                 appeal_text=appeal_text,
@@ -1732,14 +2036,16 @@ def fill_appeal_modal(
     except Exception as error:
         print(f"填表截图失败：{error}")
 
-    # 汇总里区分 A/B/A2——不同表单的可见字段不一样
+    # 汇总里区分 A/B/A2/A3——不同表单的可见字段不一样
     print()
     print(f"申诉表单填写完成（状态 {status}），未点击提交。")
     if status == "A2":
         print(f"  申诉原因：{A2_APPEAL_REASON_OTHER}（固定选择）")
+    elif status == "A3":
+        print(f"  申诉原因：{A3_APPEAL_REASON_OTHER}（固定选择，赔付类申诉）")
     elif status == "A":
         print(f"  申诉原因：{APPEAL_REASON_MAP.get(classification)}")
-    else:
+    else:   # status == "B"
         print(f"  是否认可商品问题：{STATUS_B_ADMIT_PROBLEM_TEXT}")
         print(f"  是否收到退货商品：{STATUS_B_RECEIVE_GOOD_TEXT}")
         print(f"  申诉原因：{classification}")
@@ -1753,29 +2059,25 @@ def fill_appeal_modal(
 
 def load_order_classification(order_no: str) -> tuple[str, str, str]:
     """
-    从 output/chat_<safe_order_no>.json 读取大模型分类结果。
+    从数据库读取大模型分类结果。
 
     返回 (appeal_evidence_classification, appeal_text, issue_type)。
-    如果分类结果文件不存在，抛出 FileNotFoundError。
+    如果这个订单在数据库里还没有分类结果，抛出 FileNotFoundError——沿用
+    原来的异常类型（虽然现在已经不是"文件"了，但调用方目前都是宽泛
+    except Exception 兜底，不需要为此新引入一个异常类型）。
     """
+    shop = SHOP_ID or "default"
+    order = db.get_order(shop, order_no)
 
-    json_path = (
-        OUTPUT_DIR / f"chat_{safe_filename(order_no)}.json"
-    )
-
-    if not json_path.exists():
+    if order is None:
         raise FileNotFoundError(
-            f"未找到订单 {order_no} 的分类结果文件：{json_path}\n"
-            "请先运行 run_appeal_batch.py 采集聊天记录并分类。"
+            f"数据库里没有订单 {order_no} 的分类结果。\n"
+            "请先运行 run_appeal_batch.py / main.py 采集聊天记录并分类。"
         )
 
-    data = json.loads(
-        json_path.read_text(encoding="utf-8")
-    )
-
-    classification = data.get("appeal_evidence_classification", "")
-    appeal_text = data.get("appeal_text", "")
-    issue_type = data.get("issue_type", "")
+    classification = order.get("classification") or ""
+    appeal_text = order.get("appeal_text") or ""
+    issue_type = order.get("issue_type") or ""
 
     if not classification or not appeal_text:
         raise ValueError(
@@ -1928,18 +2230,38 @@ def _dismiss_appeal_notice_modal(page: Page) -> bool:
     return False
 
 
-def _wait_for_submit_captcha(page: Page, appear_wait_sec: int = 10) -> None:
-    """点击提交按钮后，等待验证码出现并交给人工处理。
+def wait_for_submit_captcha(
+    page: Page,
+    appear_wait_sec: int = 10,
+    success_locator: Locator | None = None,
+) -> bool:
+    """点击提交后竞速等待验证码或可选的成功标志。
 
     提交后验证码通常立刻弹出，但也有网络延迟；
     appear_wait_sec 内轮询检测，一出现就调用 ensure_no_captcha 阻塞等待人工滑完，
-    5 分钟超时。
+    5 分钟超时。调用方传入 success_locator 时，只要成功标志先出现就立即返回，
+    不再为了确认“没有验证码”空等满 appear_wait_sec。
+
+    返回 True 表示等待期间已经看到 success_locator；默认不传时保持原行为并
+    返回 False。
     """
-    print("等待验证码出现...")
+    print(
+        "等待验证码或提交成功结果出现..."
+        if success_locator is not None
+        else "等待验证码出现..."
+    )
     deadline = _time.time() + appear_wait_sec
     captcha_appeared = False
 
     while _time.time() < deadline:
+        if success_locator is not None:
+            try:
+                if success_locator.count() and success_locator.is_visible():
+                    print("已看到提交成功结果，无需继续等待验证码。")
+                    return True
+            except Exception:
+                # 成功节点可能正处在 React 替换过程；下一轮继续检查。
+                pass
         if is_captcha_visible(page):
             captcha_appeared = True
             break
@@ -1950,6 +2272,13 @@ def _wait_for_submit_captcha(page: Page, appear_wait_sec: int = 10) -> None:
         ensure_no_captcha(page)
     else:
         print("未检测到验证码，提交可能已直接完成。")
+
+    if success_locator is not None:
+        try:
+            return bool(success_locator.count() and success_locator.is_visible())
+        except Exception:
+            pass
+    return False
 
 
 def click_appeal_form_submit(page: Page, status: str) -> None:
@@ -1965,6 +2294,7 @@ def click_appeal_form_submit(page: Page, status: str) -> None:
         status: "A" / "B" / "C"
     """
 
+    business_pause(page, reading=True)
     if status in ("A", "B"):
         # ── 模态框内提交 ──
         modal = page.locator(
@@ -2003,7 +2333,7 @@ def click_appeal_form_submit(page: Page, status: str) -> None:
         _dismiss_appeal_notice_modal(page)
 
         # 提交后通常立刻弹出验证码，等待一小段时间后检测
-        _wait_for_submit_captcha(page)
+        wait_for_submit_captcha(page)
 
         # 等待提交结果（modal 消失 或 页面跳转）
         try:
@@ -2042,7 +2372,7 @@ def click_appeal_form_submit(page: Page, status: str) -> None:
         _dismiss_appeal_notice_modal(page)
 
         # 提交后通常立刻弹出验证码，等待一小段时间后检测
-        _wait_for_submit_captcha(page)
+        wait_for_submit_captcha(page)
 
         # 等待提交结果（跳转或弹提示）
         try:
@@ -2079,7 +2409,7 @@ def main() -> None:
     PROFILE_DIR.mkdir(
         parents=True,
         exist_ok=True,
-    )
+    ) 
 
     order_no = input(
         "请输入订单编号，直接回车使用默认值 "
@@ -2177,7 +2507,7 @@ def main() -> None:
 
             print("请在浏览器中检查表单内容是否正确。")
             print("确认无误后可以手动点击「提交」。")
-
+            
             input("操作完成，按回车关闭浏览器：")
 
         except Exception as error:

@@ -1,4 +1,4 @@
-"""滑块/字符/旋转验证码处理。
+"""滑块/字符/旋转/图片点选验证码处理。
 
 从 pdd_chat.py 抽出：验证码是 PDD 后台随时可能弹的横切能力，
 应被所有页面操作共用，与"聊天页"无关。
@@ -11,10 +11,15 @@ import json
 import math
 import os
 import random
+import re
+import time
+import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from dotenv import load_dotenv
 from PIL import Image
 from playwright.sync_api import (
     Locator,
@@ -23,8 +28,9 @@ from playwright.sync_api import (
 )
 
 from calculate_demo_angle import calculate_angle as _calculate_angle
-from paths import DEBUG_DIR
-from stealth import human_type, jitter_wait
+from paths import DEBUG_DIR, BASE_DIR, SHOP_ID
+import captcha_diagnostics
+from stealth import human_click, human_type, jitter_wait, without_business_pacing
 
 # ============================================================
 # 滑块验证码处理
@@ -40,16 +46,36 @@ from stealth import human_type, jitter_wait
 # 同一套组件在不同页面就已经是 _5-163-0、1198e34 等不同值，升级还会再变。
 # id 和普通类名才是稳定锚点。
 CAPTCHA_SELECTOR = "#slide-captcha-dialog, .captcha-wrapper"
+VISIBLE_CAPTCHA_SELECTOR = (
+    "#slide-captcha-dialog:visible, .captcha-wrapper:visible"
+)
 
 # 旋转验证码专用选择器（区别于普通滑块/点选验证码）
 ROTATE_CAPTCHA_SELECTOR = (
     "#slide-captcha-dialog.captcha-wrapper__rotateslider, "
     ".captcha-wrapper__rotateslider"
 )
+VISIBLE_ROTATE_CAPTCHA_SELECTOR = (
+    "#slide-captcha-dialog.captcha-wrapper__rotateslider:visible, "
+    ".captcha-wrapper__rotateslider:visible"
+)
 # 字符验证码专用选择器
 TEXT_CAPTCHA_SELECTOR = (
     "#slide-captcha-dialog.captcha-wrapper__text, "
     ".captcha-wrapper__text"
+)
+VISIBLE_TEXT_CAPTCHA_SELECTOR = (
+    "#slide-captcha-dialog.captcha-wrapper__text:visible, "
+    ".captcha-wrapper__text:visible"
+)
+# 图片点选验证码专用选择器
+PICTURE_CAPTCHA_SELECTOR = (
+    "#slide-captcha-dialog.captcha-wrapper__picture, "
+    ".captcha-wrapper__picture"
+)
+VISIBLE_PICTURE_CAPTCHA_SELECTOR = (
+    "#slide-captcha-dialog.captcha-wrapper__picture:visible, "
+    ".captcha-wrapper__picture:visible"
 )
 
 # 旋转验证码自动破解 — 元素选择器（与拼多多 DOM 一一对应）
@@ -69,6 +95,11 @@ ROTATE_CAPTCHA_MIN_SCORE = float(
 # 字符验证码自动破解 — 元素选择器
 TEXT_CAPTCHA_IMG_SELECTOR = ".captcha-source img"
 TEXT_CAPTCHA_INPUT_SELECTOR = "#captchaInput"
+PICTURE_CAPTCHA_IMG_SELECTOR = "#captchaClickImg, .picture-img img"
+PICTURE_CAPTCHA_QUESTION_SELECTOR = ".picture-text__default, .picture-text"
+PICTURE_CAPTCHA_MIN_CONFIDENCE = float(
+    os.environ.get("PDDCHAT_PICTURE_MIN_CONFIDENCE", "0.55")
+)
 # 备用选择器（容器内泛化搜索，覆盖未来版本变化）
 CAPTCHA_BG_FALLBACK = "img:first-of-type, canvas:first-of-type"
 CAPTCHA_CIRCLE_FALLBACK = "img:nth-of-type(2), canvas:nth-of-type(2)"
@@ -77,6 +108,9 @@ CAPTCHA_BUTTON_FALLBACK = "[class*='button']:not([type='submit'])"
 
 # 等待人工滑完的最长时间：5 分钟
 CAPTCHA_WAIT_TIMEOUT = 5 * 60 * 1000
+# 自动验证统一等待 5 秒；每种可自动处理的验证码最多尝试 5 次。
+CAPTCHA_VERIFY_TIMEOUT = 5_000
+CAPTCHA_AUTO_MAX_ATTEMPTS = 5
 
 
 def is_captcha_visible(page: Page) -> bool:
@@ -90,12 +124,7 @@ def is_captcha_visible(page: Page) -> bool:
     """
 
     try:
-        dialog = page.locator(CAPTCHA_SELECTOR)
-
-        if dialog.count() == 0:
-            return False
-
-        return dialog.first.is_visible()
+        return page.locator(VISIBLE_CAPTCHA_SELECTOR).count() > 0
 
     except Exception:
         return False
@@ -109,11 +138,7 @@ def is_rotate_captcha(page: Page) -> bool:
     才能用图片角度识别方案自动破解。
     """
     try:
-        dialog = page.locator(ROTATE_CAPTCHA_SELECTOR)
-        if dialog.count() == 0:
-            return False
-
-        return dialog.first.is_visible()
+        return page.locator(VISIBLE_ROTATE_CAPTCHA_SELECTOR).count() > 0
 
     except Exception:
         return False
@@ -122,12 +147,16 @@ def is_rotate_captcha(page: Page) -> bool:
 def is_text_captcha(page: Page) -> bool:
     """检测当前验证码是否是字符验证码（容器带 captcha-wrapper__text 类）。"""
     try:
-        dialog = page.locator(TEXT_CAPTCHA_SELECTOR)
-        if dialog.count() == 0:
-            return False
+        return page.locator(VISIBLE_TEXT_CAPTCHA_SELECTOR).count() > 0
 
-        return dialog.first.is_visible()
+    except Exception:
+        return False
 
+
+def is_picture_captcha(page: Page) -> bool:
+    """检测当前验证码是否是图片点选验证码。"""
+    try:
+        return page.locator(VISIBLE_PICTURE_CAPTCHA_SELECTOR).count() > 0
     except Exception:
         return False
 
@@ -149,7 +178,8 @@ def save_captcha_screenshot(page: Page) -> Path | None:
         exist_ok=True,
     )
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 同一秒内可能连续重试，带上毫秒以免后一次截图覆盖前一次。
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
     screenshot_path = (
         DEBUG_DIR / f"captcha_{timestamp}.png"
@@ -189,9 +219,9 @@ def wait_for_human_captcha(
 
     print()
     print("=" * 60)
-    print("检测到滑块验证码，自动化已暂停。")
-    print("请在打开的浏览器窗口中手动完成滑块拼图。")
-    print("滑完后程序会自动继续，不需要回到控制台按键。")
+    print("检测到验证码，自动化已暂停。")
+    print("请在打开的浏览器窗口中手动完成验证码。")
+    print("验证通过后程序会自动继续，不需要回到控制台按键。")
     print(f"最长等待 {wait_text}。")
 
     if screenshot_path:
@@ -205,7 +235,7 @@ def wait_for_human_captcha(
     try:
         # state="hidden" 同时覆盖"节点被移除"和"节点还在但隐藏"两种消失方式
         page.wait_for_selector(
-            CAPTCHA_SELECTOR,
+            VISIBLE_CAPTCHA_SELECTOR,
             state="hidden",
             timeout=timeout,
         )
@@ -579,9 +609,9 @@ def try_auto_solve_rotate_captcha(page: Page) -> bool:
         # ── 6. 验证结果 ──
         try:
             page.wait_for_selector(
-                CAPTCHA_SELECTOR,
+                VISIBLE_CAPTCHA_SELECTOR,
                 state="hidden",
-                timeout=5_000,
+                timeout=CAPTCHA_VERIFY_TIMEOUT,
             )
             print("自动破解：验证码已消失，破解成功！")
             jitter_wait(page, 1_000)
@@ -595,123 +625,536 @@ def try_auto_solve_rotate_captcha(page: Page) -> bool:
         return False
 
 
+_active_attempt: dict | None = None
+
+
+def _recorded_solve(page, captcha_type, solver, challenge_id, attempt):
+    global _active_attempt
+    record = {
+        "id": uuid.uuid4().hex, "challenge_id": challenge_id,
+        "shop": SHOP_ID or "default", "type": captcha_type, "attempt": attempt,
+        "started_at": datetime.now().isoformat(), "passed": False,
+        "messages": [], "capture_errors": [],
+    }
+    artifacts = {}
+    started = time.monotonic()
+    try:
+        selector = VISIBLE_TEXT_CAPTCHA_SELECTOR if captcha_type == "字符" else VISIBLE_PICTURE_CAPTCHA_SELECTOR
+        element = page.locator(selector).last
+        for name, capture in (
+            ("element.html", lambda: element.evaluate("el => el.outerHTML").encode("utf-8")),
+            ("captcha.png", lambda: element.screenshot(timeout=3000)),
+        ):
+            try:
+                artifacts[name] = capture()
+            except Exception as exc:
+                record["capture_errors"].append(f"{name}: {type(exc).__name__}")
+        _active_attempt = {"record": record, "artifacts": artifacts}
+        record["passed"] = bool(solver(page))
+        return record["passed"]
+    finally:
+        _active_attempt = None
+        record["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        record["finished_at"] = datetime.now().isoformat()
+        try:
+            captcha_diagnostics.save_attempt(BASE_DIR / "debug" / "captcha_attempts", record, artifacts)
+        except Exception as exc:
+            print(f"[验证码诊断] 记录保存失败：{type(exc).__name__}: {exc}")
+
+
+def _captcha_diagnostic(message: str) -> None:
+    if _active_attempt is not None and len(_active_attempt["record"]["messages"]) < 64:
+        _active_attempt["record"]["messages"].append(message[:2000])
+    print(f"[验证码诊断] {message}", flush=True)
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        with (DEBUG_DIR / "captcha_diagnostics.log").open("a", encoding="utf-8") as stream:
+            stream.write(f"{datetime.now().isoformat()} {message}\n")
+    except OSError:
+        pass
+
+
+def _normalize_text_captcha_result(value: str) -> str:
+    """只接受可直接填入验证码输入框的字母数字结果。"""
+    text = str(value or "").strip().strip("`").strip()
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+    if compact.upper() == "UNKNOWN":
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9]{1,16}", compact):
+        return ""
+    return compact
+
+
+class CaptchaRefreshError(RuntimeError):
+    """没有确认换题成功，禁止再次识别旧图。"""
+
+
+_CAPTCHA_REFRESH_STATE_JS = """() => {
+    const visible = el => !!(el && el.getClientRects().length &&
+        getComputedStyle(el).visibility !== 'hidden');
+    const containers = [...document.querySelectorAll('#slide-captcha-dialog, .captcha-wrapper')].filter(visible);
+    const box = containers[containers.length - 1];
+    if (!box) return {kind: 'none', sources: [], ready: false};
+    const kind = box.classList.contains('captcha-wrapper__text') ? '字符' :
+        box.classList.contains('captcha-wrapper__picture') ? '点选' :
+        box.classList.contains('captcha-wrapper__rotateslider') ? '旋转' : '未知';
+    // captchaImg 是刷新图标，不能作为验证码原图判断是否换题。
+    const images = [...box.querySelectorAll('.captcha-source img, #captchaClickImg, .rotateslider-img-bg img, img.rotateslider-img-bg')];
+    return {kind, sources: images.map(img => img.currentSrc || img.src),
+        question: (box.querySelector('.picture-text')?.textContent || '').trim(),
+        ready: images.length > 0 && images.every(img => img.complete && img.naturalWidth > 0)};
+}"""
+
+
+def _refresh_and_confirm_captcha(page: Page, label: str) -> None:
+    """重新定位当前容器，最多点击两次，每次等五秒确认换图或换题型。"""
+    network_events = []
+    def network(event, phase):
+        try:
+            url = urlsplit(event.url)
+            if any(word in url.path.lower() for word in ("captcha", "verify", "challenge")) and len(network_events) < 20:
+                network_events.append({"phase": phase, "path": url.path,
+                                       "status": getattr(event, "status", None) if phase == "response" else None})
+        except Exception:
+            pass
+    def requested(request):
+        network(request, "request")
+    def responded(response):
+        network(response, "response")
+    def failed(request):
+        network(request, "requestfailed")
+    def capture(number, phase):
+        if _active_attempt is None:
+            return
+        try:
+            box = page.locator(VISIBLE_CAPTCHA_SELECTOR).last
+            prefix = f"refresh_{number}_{phase}"
+            _active_attempt["artifacts"][prefix + ".png"] = box.screenshot(timeout=1500)
+            _active_attempt["artifacts"][prefix + ".html"] = box.evaluate("el => el.outerHTML").encode("utf-8")
+        except Exception as exc:
+            _active_attempt["record"]["capture_errors"].append(f"refresh_{phase}: {type(exc).__name__}")
+    page.on("request", requested)
+    page.on("response", responded)
+    page.on("requestfailed", failed)
+    try:
+        before = page.evaluate(_CAPTCHA_REFRESH_STATE_JS)
+        if before["kind"] == "none":
+            _captcha_diagnostic(f"{label}刷新前验证码已消失")
+            return
+        for click_attempt in range(1, 3):
+            # 刷新可能重建 DOM 或切换题型，不能复用旧题型的容器。
+            container = page.locator(VISIBLE_CAPTCHA_SELECTOR).last
+            button = container.locator(CAPTCHA_REFRESH_SELECTOR + ":visible").first
+            if button.count() == 0:
+                raise CaptchaRefreshError("当前验证码未找到可见刷新按钮")
+            _captcha_diagnostic(f"{label}找到刷新按钮，准备第 {click_attempt}/2 次点击")
+            capture(click_attempt, "before")
+            icon = button.locator("img:visible").first
+            target = icon if icon.count() else button
+            _captcha_diagnostic("刷新点击目标：" + ("按钮内的图片图标" if target is icon else "外层按钮（未找到图片图标）"))
+            target.click(timeout=3_000)
+            _captcha_diagnostic(f"{label}已点击刷新按钮，等待新图片加载（最多5秒）")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                after = page.evaluate(_CAPTCHA_REFRESH_STATE_JS)
+                if after["kind"] != "none" and after["kind"] != before["kind"]:
+                    capture(click_attempt, "after")
+                    _captcha_diagnostic(f"刷新已生效：验证码由{before['kind']}变为{after['kind']}，下一轮重新判断题型")
+                    return
+                if after["ready"] and after["sources"] != before["sources"]:
+                    capture(click_attempt, "after")
+                    _captcha_diagnostic("刷新已生效：验证码图片已变化且加载完成")
+                    return
+                page.wait_for_timeout(200)
+            capture(click_attempt, "after")
+            _captcha_diagnostic("刷新尚未确认生效：未检测到新图片或新题型")
+        raise CaptchaRefreshError("两次点击刷新后仍未确认换题，跳过当前订单，避免重复识别旧图片")
+    except Exception as exc:
+        _captcha_diagnostic(f"验证码刷新未完成：{type(exc).__name__}: {exc}")
+        if isinstance(exc, CaptchaRefreshError):
+            raise
+        raise CaptchaRefreshError("验证码刷新异常，跳过当前订单") from exc
+    finally:
+        page.remove_listener("request", requested)
+        page.remove_listener("response", responded)
+        page.remove_listener("requestfailed", failed)
+        _captcha_diagnostic("刷新期间相关请求记录：" + json.dumps(network_events, ensure_ascii=False))
+        if _active_attempt is not None:
+            _active_attempt["record"].setdefault("refresh_network", []).extend(network_events)
+
+
+def _refresh_text_captcha(page: Page, captcha: Locator) -> None:
+    _refresh_and_confirm_captcha(page, "字符验证码")
+
+
+def _same_captcha_after_verification(page: Page, before: dict) -> bool:
+    """平台可能在验证失败后自动换题；只有原题仍在时才需要手动刷新。"""
+    after = page.evaluate(_CAPTCHA_REFRESH_STATE_JS)
+    if after["kind"] == "none":
+        _captcha_diagnostic("等待后验证码已消失，无需刷新")
+        return False
+    if any(after.get(key) != before.get(key) for key in ("kind", "sources", "question")):
+        _captcha_diagnostic("等待5秒后验证码已变化，无需点击刷新，下一轮重新识别当前题型")
+        return False
+    _captcha_diagnostic("等待5秒后验证码仍与操作前相同，准备点击刷新")
+    return True
+
+
+def _refresh_visible_captcha(page: Page, captcha_type: str) -> None:
+    """刷新当前仍可见的验证码，供没有容器引用的处理流程使用。"""
+    try:
+        visible = page.locator(VISIBLE_CAPTCHA_SELECTOR)
+        if visible.count() == 0:
+            return
+        refresh = visible.last.locator(CAPTCHA_REFRESH_SELECTOR)
+        if refresh.count() == 0 or not refresh.first.is_visible():
+            _captcha_diagnostic(f"{captcha_type}验证码仍存在，但未找到刷新按钮")
+            return
+        refresh.first.click()
+        jitter_wait(page, 700)
+        _captcha_diagnostic(f"{captcha_type}验证码 5 秒后仍存在，已点击刷新")
+    except Exception as exc:
+        _captcha_diagnostic(
+            f"刷新{captcha_type}验证码失败：{type(exc).__name__}: {exc}"
+        )
+
+
 def try_auto_solve_text_captcha(page: Page) -> bool:
     """尝试自动破解字符验证码。
 
     流程：截图验证码图片 → AI 识别字符 → 点击输入框 → 模拟打字输入。
     任意步骤失败都返回 False，让调用方回退到人工处理。
     """
+    stage = "检查验证码容器"
+    captcha: Locator | None = None
     try:
-        captcha = page.locator(CAPTCHA_SELECTOR).first
-        if not captcha.is_visible():
+        visible_captchas = page.locator(VISIBLE_TEXT_CAPTCHA_SELECTOR)
+        if visible_captchas.count() == 0:
+            _captcha_diagnostic(f"{stage}：容器不可见，尚未输入")
             return False
+        captcha = visible_captchas.last
 
-        if not is_text_captcha(page):
-            return False
-
-        # ── 1. 截图验证码图片 ──
+        # ── 1. 提取验证码原图 ──
+        stage = "定位验证码图片"
         img_el = captcha.locator(TEXT_CAPTCHA_IMG_SELECTOR)
         if img_el.count() == 0:
-            print("字符验证码：无法定位验证码图片。")
+            _captcha_diagnostic(f"{stage}失败，尚未输入")
+            _refresh_text_captcha(page, captcha)
             return False
 
-        print("字符验证码：正在截图并 AI 识别...")
-        img_bytes = img_el.first.screenshot()
+        print("字符验证码：正在提取原图并 AI 识别...")
+        stage = "提取验证码原图"
+        img_bytes = _extract_captcha_image_bytes(page, img_el.first)
+        if img_bytes is None:
+            _captcha_diagnostic("原图提取失败，改用元素截图")
+            img_bytes = img_el.first.screenshot()
         img_b64 = base64.b64encode(img_bytes).decode("ascii")
         data_uri = f"data:image/png;base64,{img_b64}"
 
         # ── 2. AI 识别 ──
-        result = _ai_recognize_text_captcha(data_uri)
+        stage = "调用识别接口"
+        try:
+            raw_result = _ai_recognize_text_captcha(data_uri)
+        except Exception as exc:
+            if _is_captcha_ai_timeout(exc):
+                _captcha_diagnostic(
+                    "字符验证码 AI 识别超过 60 秒，正在刷新验证码后重试"
+                )
+                _refresh_text_captcha(page, captcha)
+                return False
+            raise
+        result = _normalize_text_captcha_result(raw_result)
         if not result:
-            print("字符验证码：AI 识别结果为空，回退人工。")
+            _captcha_diagnostic(
+                f"{stage}未返回可填写的纯字母数字结果，尚未输入；"
+                f"AI 原始返回={raw_result!r}"
+            )
+            _refresh_text_captcha(page, captcha)
             return False
 
         print(f"字符验证码：AI 识别结果 → \"{result}\"")
 
         # ── 3. 点击输入框并输入 ──
+        stage = "定位输入框"
         input_el = captcha.locator(TEXT_CAPTCHA_INPUT_SELECTOR)
         if input_el.count() == 0:
-            print("字符验证码：无法定位输入框。")
+            _captcha_diagnostic(f"{stage}失败，尚未输入")
+            _refresh_text_captcha(page, captcha)
             return False
 
-        input_el.first.click()
+        target_input = input_el.first
+        before_verification = page.evaluate(_CAPTCHA_REFRESH_STATE_JS)
+        stage = "移动鼠标并点击输入框"
+        human_click(page, target_input)
         jitter_wait(page, 200)
-        # human_type 签名是 (page, locator, text, ...)，之前少传 page 导致每次 TypeError
-        # 被下面 except Exception 吞掉，误报"AI 识别失败"。
-        human_type(page, input_el.first, result)
+        stage = "清空输入框"
+        target_input.press("Control+A")
+        target_input.press("Backspace")
+        stage = "输入字符"
+        human_type(page, target_input, result, click_first=False)
+        _captcha_diagnostic(f"已自动输入 AI 识别结果 {result!r}，等待平台验证")
+        stage = "等待平台验证"
 
         # ── 4. 验证结果 ──
-        jitter_wait(page, 500)
         try:
             page.wait_for_selector(
-                CAPTCHA_SELECTOR,
+                VISIBLE_CAPTCHA_SELECTOR,
                 state="hidden",
-                timeout=5_000,
+                timeout=CAPTCHA_VERIFY_TIMEOUT,
             )
             print("字符验证码：验证码已消失，破解成功！")
             jitter_wait(page, 500)
             return True
         except PlaywrightTimeoutError:
-            # 验证码输入后可能再过几秒才生效，多等一会
-            page.wait_for_timeout(2_000)
-            if not is_captcha_visible(page):
-                print("字符验证码：延迟检测到验证码消失，破解成功！")
-                return True
-            print("字符验证码：输入后验证码仍然存在，破解失败。")
+            _captcha_diagnostic("输入后验证码仍然存在，未确认通过")
+            if _same_captcha_after_verification(page, before_verification):
+                _refresh_text_captcha(page, captcha)
             return False
 
+    except CaptchaRefreshError:
+        raise
     except Exception as exc:
-        print(f"字符验证码：发生异常，回退人工。{exc}")
+        _captcha_diagnostic(f"{stage}异常：{type(exc).__name__}: {exc}")
+        if captcha is not None:
+            _refresh_text_captcha(page, captcha)
         return False
 
 
-def _ai_recognize_text_captcha(data_uri: str) -> str:
-    """将验证码图片 data URI 发送给 AI 模型识别，返回识别出的文字。"""
-    import os
+def _refresh_picture_captcha(page: Page, captcha: Locator) -> None:
+    _refresh_and_confirm_captcha(page, "点选验证码")
 
-    from openai import OpenAI
 
-    api_key = os.getenv("ARK_API_KEY")
+def _dump_picture_captcha_info(
+    *,
+    question: str,
+    result: dict[str, object],
+    image_box: dict[str, float],
+    click_x: float,
+    click_y: float,
+) -> Path | None:
+    """保存不含图片内容的点选定位参数，供误点或泄漏排查。"""
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        path = DEBUG_DIR / f"picture_captcha_{timestamp}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "timestamp": timestamp,
+                    "question": question,
+                    "model_result": result,
+                    "image_box": image_box,
+                    "viewport_click": {"x": click_x, "y": click_y},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return path
+    except Exception as exc:
+        _captcha_diagnostic(f"保存点选验证码定位参数失败：{type(exc).__name__}: {exc}")
+        return None
+
+
+def try_auto_solve_picture_captcha(page: Page) -> bool:
+    """用视觉模型定位点选目标，换算为当前图片坐标并点击。"""
+    stage = "检查点选验证码容器"
+    captcha: Locator | None = None
+    try:
+        visible_captchas = page.locator(VISIBLE_PICTURE_CAPTCHA_SELECTOR)
+        if visible_captchas.count() == 0:
+            _captcha_diagnostic(f"{stage}：容器不可见，尚未点击")
+            return False
+        captcha = visible_captchas.last
+
+        stage = "读取点选题目"
+        question_el = captcha.locator(PICTURE_CAPTCHA_QUESTION_SELECTOR)
+        if question_el.count() == 0:
+            raise RuntimeError("未找到题目元素")
+        question = question_el.first.inner_text().strip()
+        if not question:
+            raise RuntimeError("题目为空")
+
+        stage = "定位点选图片"
+        image_el = captcha.locator(PICTURE_CAPTCHA_IMG_SELECTOR)
+        if image_el.count() == 0:
+            raise RuntimeError("未找到点选图片")
+        image = image_el.first
+        image.scroll_into_view_if_needed()
+
+        # 使用元素截图而非原图 src。模型看到的像素与元素显示区域一一对应，
+        # 页面缩放、CSS 尺寸和 devicePixelRatio 都不会改变比例换算。
+        stage = "截取点选图片"
+        image_bytes = image.screenshot()
+        data_uri = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
+
+        stage = "调用点选识别接口"
+        try:
+            result = _ai_locate_picture_captcha(data_uri, question)
+        except Exception as exc:
+            if _is_captcha_ai_timeout(exc):
+                _captcha_diagnostic("点选验证码 AI 识别超过 60 秒，正在刷新后重试")
+            else:
+                _captcha_diagnostic(f"{stage}失败：{type(exc).__name__}: {exc}")
+            _refresh_picture_captcha(page, captcha)
+            return False
+
+        confidence = float(result["confidence"])
+        if confidence < PICTURE_CAPTCHA_MIN_CONFIDENCE:
+            _captcha_diagnostic(
+                f"点选定位置信度 {confidence:.3f} 低于阈值 "
+                f"{PICTURE_CAPTCHA_MIN_CONFIDENCE:.3f}，刷新后重试"
+            )
+            _refresh_picture_captcha(page, captcha)
+            return False
+
+        stage = "换算点击坐标"
+        # 模型请求期间页面可能发生布局变化，所以在点击前重新读取元素框。
+        image_box = image.bounding_box()
+        if image_box is None:
+            raise RuntimeError("点选图片不可见")
+        box_values = tuple(float(image_box[key]) for key in ("x", "y", "width", "height"))
+        if not all(math.isfinite(value) for value in box_values):
+            raise RuntimeError("点选图片位置包含非有限数值")
+        if image_box["width"] <= 0 or image_box["height"] <= 0:
+            raise RuntimeError("点选图片尺寸异常")
+        point = result["target_point_2d"]
+        point_x, point_y = float(point[0]), float(point[1])
+        click_x = image_box["x"] + point_x / 1000 * image_box["width"]
+        click_y = image_box["y"] + point_y / 1000 * image_box["height"]
+
+        info_path = _dump_picture_captcha_info(
+            question=question,
+            result=result,
+            image_box=image_box,
+            click_x=click_x,
+            click_y=click_y,
+        )
+        _captcha_diagnostic(
+            f"点选题目={question!r}，目标={result['target_name']!r}，"
+            f"置信度={confidence:.3f}，点击=({click_x:.1f}, {click_y:.1f})，"
+            f"参数={info_path or '保存失败'}"
+        )
+
+        stage = "点击目标"
+        before_verification = page.evaluate(_CAPTCHA_REFRESH_STATE_JS)
+        page.mouse.move(click_x, click_y)
+        jitter_wait(page, 150)
+        page.mouse.click(click_x, click_y)
+        stage = "等待平台验证"
+        try:
+            page.wait_for_selector(
+                VISIBLE_CAPTCHA_SELECTOR,
+                state="hidden",
+                timeout=CAPTCHA_VERIFY_TIMEOUT,
+            )
+            print("点选验证码：验证码已消失，破解成功！")
+            jitter_wait(page, 500)
+            return True
+        except PlaywrightTimeoutError:
+            _captcha_diagnostic("点击后验证码仍然存在，检查是否已自动换题")
+            if _same_captcha_after_verification(page, before_verification):
+                _refresh_picture_captcha(page, captcha)
+            return False
+    except CaptchaRefreshError:
+        raise
+    except Exception as exc:
+        _captcha_diagnostic(f"{stage}异常：{type(exc).__name__}: {exc}")
+        if captcha is not None:
+            _refresh_picture_captcha(page, captcha)
+        return False
+
+
+def _ai_locate_picture_captcha(
+    data_uri: str,
+    question: str,
+) -> dict[str, object]:
+    """使用 qwen_client 定位点选目标，单次最多等待 60 秒。"""
+    import qwen_client
+
+    if _active_attempt is not None:
+        _active_attempt["artifacts"]["image.png"] = base64.b64decode(data_uri.split(",", 1)[1])
+        _active_attempt["record"]["question"] = question
+
+    env_file = Path(__file__).resolve().parent / ".env"
+    load_dotenv(dotenv_path=env_file, override=False)
+    api_key = os.getenv("QWEN_API_KEY")
     if not api_key:
-        print("字符验证码：未设置 ARK_API_KEY 环境变量，无法识别。")
-        return ""
+        raise RuntimeError(
+            f"未找到 QWEN_API_KEY（已检查系统环境变量和 {env_file}）；"
+            "点选验证码需要配置千问接口密钥"
+        )
+    with qwen_client.create_client(api_key=api_key, timeout=60) as client:
+        result = qwen_client.locate_geometry_captcha_data_uri(
+            client,
+            data_uri,
+            question,
+            enable_thinking=False,
+        )
+        if _active_attempt is not None:
+            _active_attempt["record"]["model_result"] = result
+        return result
 
-    client = OpenAI(
-        base_url="https://ark.cn-beijing.volces.com/api/v3",
-        api_key=api_key.strip(),
-        timeout=30,
-        max_retries=1,
-    )
 
-    response = client.chat.completions.create(
-        model="ep-20260811104144-2xf9c",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": data_uri}},
-                    {
-                        "type": "text",
-                        "text": (
-                            "识别图片中的字母和数字。"
-                            "忽略图标、卡通装饰和背景纹理。"
-                            "严格区分大小写，只输出识别结果，"
-                            "不要输出解释、标点或其他内容。"
-                        ),
-                    },
-                ],
-            }
-        ],
-        temperature=0,
-        max_tokens=30,
-    )
+def _ai_recognize_text_captcha(data_uri: str) -> str:
+    """使用 qwen_client 的千问模型识别验证码，单次最多等待 60 秒。"""
+    import qwen_client
 
-    content = response.choices[0].message.content
-    return content.strip() if content else ""
+    if _active_attempt is not None:
+        _active_attempt["artifacts"]["image.png"] = base64.b64decode(data_uri.split(",", 1)[1])
+
+    # GUI -> 调度器 -> 店铺 worker 是多层子进程。不能指望最外层 GUI 已经把
+    # 项目 .env 注入系统环境；每个真正调用识别接口的 worker 都在这里按
+    # captcha.py 所在目录显式加载一次，且不覆盖用户已经设置的系统变量。
+    env_file = Path(__file__).resolve().parent / ".env"
+    load_dotenv(dotenv_path=env_file, override=False)
+    api_key = os.getenv("QWEN_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            f"未找到 QWEN_API_KEY（已检查系统环境变量和 {env_file}）；"
+            "字符验证码现已改用 qwen_client.py，请配置千问接口密钥"
+        )
+
+    with qwen_client.create_client(api_key=api_key, timeout=60) as client:
+        result = qwen_client.recognize_captcha_data_uri(
+            client,
+            data_uri,
+            enable_thinking=False,
+        )
+        if _active_attempt is not None:
+            _active_attempt["record"]["model_result"] = result
+        return result
+
+
+def _is_captcha_ai_timeout(exc: BaseException) -> bool:
+    """识别 OpenAI/httpx 包装前后的超时异常。"""
+    try:
+        import httpx
+        from openai import APITimeoutError
+
+        timeout_types = (APITimeoutError, httpx.TimeoutException, TimeoutError)
+    except ImportError:
+        timeout_types = (TimeoutError,)
+
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        if isinstance(current, timeout_types):
+            return True
+        visited.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
 
 
 # 模块级开关：是否启用自动破解验证码（由 main.py 根据命令行参数设置）
 _auto_solve_captcha = True
+
+# 模块级开关：兼容旧调用方。自动模式下所有验证码五次失败均跳过当前任务；
+# 人工模式仍从一开始等待人工处理。
+_give_up_after_auto_solve_fails = False
 
 
 def set_auto_solve_captcha(enabled: bool) -> None:
@@ -722,13 +1165,23 @@ def set_auto_solve_captcha(enabled: bool) -> None:
     print(f"[验证码模式] 已设置为：{mode}")
 
 
+def set_give_up_after_auto_solve_fails(enabled: bool) -> None:
+    """兼容旧调用方；自动模式现在统一在五次失败后跳过当前订单。"""
+    global _give_up_after_auto_solve_fails
+    _give_up_after_auto_solve_fails = enabled
+    print("[验证码模式] 自动处理 5 次失败后：跳过当前订单")
+
+
+@without_business_pacing
 def ensure_no_captcha(
     page: Page,
     timeout: int = CAPTCHA_WAIT_TIMEOUT,
 ) -> None:
     """
-    关键步骤前后调用：有验证码就先尝试自动破解，失败再等人工。
-    等待超时会抛出异常，在批量流程里会被单个订单捕获，不会中断整个批次。
+    关键步骤前后调用：字符验证码由 AI 分析并自动填写，点选验证码由 AI
+    分析目标坐标并自动点击。自动模式下所有类型共用五次尝试，五次未通过
+    就抛出异常并跳过当前订单；人工模式仍等待人工处理。异常会由批量流程
+    按单捕获，不会中断整个批次。
     """
     if not is_captcha_visible(page):
         return
@@ -738,45 +1191,68 @@ def ensure_no_captcha(
         print("请在浏览器中完成验证码，程序将在验证码通过后自动继续。")
         if not wait_for_human_captcha(page, timeout=timeout):
             raise RuntimeError(
-                "滑块验证码在等待时间内没有被处理完成。"
+                "验证码在等待时间内没有被处理完成。"
             )
         return
 
-    # 字符验证码？AI 识别后填入，最多重试 3 次
-    if is_text_captcha(page):
-        for attempt in range(1, 4):
-            print(f"尝试 AI 识别字符验证码...（第 {attempt}/3 次）")
-            if try_auto_solve_text_captcha(page):
-                print("字符验证码自动破解成功。")
-                return
-            if attempt < 3 and is_captcha_visible(page):
-                print(f"第 {attempt} 次 AI 识别失败，准备重试...")
-                jitter_wait(page, 500)
-
-        print("字符验证码 3 次均失败，回退到人工处理模式。")
-        if not wait_for_human_captcha(page, timeout=timeout):
-            raise RuntimeError(
-                "滑块验证码在等待时间内没有被处理完成。"
+    # 刷新可能改变题型；所有题型共享尝试次数，每轮重新分派。
+    challenge_id = uuid.uuid4().hex
+    previous_type = None
+    for attempt in range(1, CAPTCHA_AUTO_MAX_ATTEMPTS + 1):
+        if not is_captcha_visible(page):
+            return
+        if is_picture_captcha(page):
+            captcha_type, solver = "点选", try_auto_solve_picture_captcha
+        elif is_text_captcha(page):
+            captcha_type, solver = "字符", try_auto_solve_text_captcha
+        elif is_rotate_captcha(page):
+            captcha_type, solver = "旋转", try_auto_solve_rotate_captcha
+        else:
+            captcha_type, solver = "未知", None
+            _captcha_diagnostic(
+                f"未知验证码开始第 {attempt}/{CAPTCHA_AUTO_MAX_ATTEMPTS} 次自动处理"
             )
-        return
-
-    # 旋转验证码：图片角度识别 + 拖动
-    if is_rotate_captcha(page):
-        for attempt in range(1, 4):
-            print(f"尝试自动破解旋转验证码...（第 {attempt}/3 次）")
-            if try_auto_solve_rotate_captcha(page):
-                print("旋转验证码自动破解成功。")
-                return
-            if attempt < 3 and is_captcha_visible(page):
-                print(f"第 {attempt} 次破解失败，准备重试...")
+            _refresh_visible_captcha(page, captcha_type)
+            shot = save_captcha_screenshot(page)
+            _captcha_diagnostic(
+                f"第 {attempt}/{CAPTCHA_AUTO_MAX_ATTEMPTS} 次未完成；"
+                f"现场截图：{shot or '保存失败'}"
+            )
+            previous_type = captcha_type
+            if attempt < CAPTCHA_AUTO_MAX_ATTEMPTS:
                 jitter_wait(page, 500)
+            continue
 
-        print("旋转验证码 3 次均失败，回退到人工处理模式。")
-    else:
-        print("当前弹出未知类型的验证码，无法自动破解。")
-
-    # 回退人工
-    if not wait_for_human_captcha(page, timeout=timeout):
-        raise RuntimeError(
-            "滑块验证码在等待时间内没有被处理完成。"
+        if previous_type is not None and previous_type != captcha_type:
+            _captcha_diagnostic(
+                f"验证码类型由{previous_type}变为{captcha_type}，切换处理方式，累计次数不重置"
+            )
+        previous_type = captcha_type
+        _captcha_diagnostic(
+            f"{captcha_type}验证码开始第 {attempt}/{CAPTCHA_AUTO_MAX_ATTEMPTS} 次自动处理"
         )
+        passed = (
+            _recorded_solve(page, captcha_type, solver, challenge_id, attempt)
+            if captcha_type in ("字符", "点选") else solver(page)
+        )
+        if passed:
+            print(f"{captcha_type}验证码自动处理成功。")
+            return
+        if not is_captcha_visible(page):
+            return
+        # 字符和点选处理函数内部已经刷新；旋转在这里刷新一次。
+        if captcha_type == "旋转":
+            _refresh_visible_captcha(page, captcha_type)
+        shot = save_captcha_screenshot(page)
+        _captcha_diagnostic(
+            f"第 {attempt}/{CAPTCHA_AUTO_MAX_ATTEMPTS} 次未完成；现场截图：{shot or '保存失败'}"
+        )
+        if attempt < CAPTCHA_AUTO_MAX_ATTEMPTS:
+            jitter_wait(page, 500)
+
+    if not is_captcha_visible(page):
+        return
+    _captcha_diagnostic(
+        "验证码自动处理 5 次均失败，跳过当前订单"
+    )
+    raise RuntimeError("验证码自动处理 5 次均失败，跳过当前订单。")

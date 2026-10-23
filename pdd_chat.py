@@ -1,24 +1,19 @@
 from __future__ import annotations
 
 import json
+import random
 import re
-from pathlib import Path
-
 from datetime import datetime
+from pathlib import Path
 
 from playwright.sync_api import (
     Page,
-    TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
 )
-
-from paths import (
-    DEFAULT_ORDER_NO,
-    EVIDENCE_DIR,
-    OUTPUT_DIR,
-    PROFILE_DIR,
+from playwright.sync_api import (
+    TimeoutError as PlaywrightTimeoutError,
 )
-from screenshots import safe_filename, save_error_screenshot, to_relative_evidence_path
+
 from blockers import (
     clear_blockers,
     safe_click,
@@ -29,8 +24,22 @@ from login import (
     get_query_button,
     wait_for_login,
 )
-from stealth import create_stealth_context, human_delay, human_type, jitter_wait
-
+from paths import (
+    DEFAULT_ORDER_NO,
+    EVIDENCE_DIR,
+    OUTPUT_DIR,
+    PROFILE_DIR,
+    START_URL,
+)
+from screenshots import safe_filename, save_error_screenshot, to_relative_evidence_path
+from stealth import (
+    create_stealth_context,
+    human_click,
+    human_delay,
+    human_scroll,
+    human_type,
+    jitter_wait,
+)
 
 # ============================================================
 # 查询方式和订单输入
@@ -83,7 +92,7 @@ def select_order_search_mode(page: Page) -> None:
             }
             """,
             timeout=10_000,
-        )
+        ).dispose()
 
     except PlaywrightTimeoutError:
         # 某些页面状态更新较慢，但输入框可能已经显示。
@@ -117,11 +126,26 @@ def fill_order_number(
         timeout=20_000,
     )
 
-    # 用模拟真人逐键输入替代 order_input.fill(order_no)
-    # .fill() 是瞬间完成的，不产生 keydown/keyup 事件，极易被风控识别
-    human_type(page, order_input, order_no)
+    # 标签页会被后续订单复用，所以输入框里可能还保留上一笔订单号。先按
+    # 真人操作全选并删除，再检查 DOM 中的实际 value；React 受控输入框
+    # 偶尔漏掉快捷键事件时，用 fill("") 作为清空兜底。
+    human_click(page, order_input)
+    human_delay(120, 320)
+    order_input.press("Control+A")
+    human_delay(80, 220)
+    order_input.press("Backspace")
+    human_delay(100, 260)
 
-    current_value = order_input.input_value()
+    if (order_input.input_value() or "").strip():
+        order_input.fill("")
+    if (order_input.input_value() or "").strip():
+        raise RuntimeError("聊天记录订单编号输入框清空失败，已停止本单查询。")
+
+    # 清空校验通过后再逐键输入；click_first=False 避免重复点击导致焦点或
+    # 光标位置发生变化。输入完成后仍要验证实际值，正确才允许点击查询。
+    human_type(page, order_input, order_no, click_first=False)
+
+    current_value = (order_input.input_value() or "").strip()
 
     if current_value != order_no:
         raise RuntimeError(
@@ -160,138 +184,67 @@ def get_result_signature(page: Page) -> str:
 
 
 def start_result_observer(page: Page) -> None:
-    """监听查询结果区域的 DOM 变化。"""
-
-    page.evaluate(
-        """
-        () => {
-            if (window.__pddChatObserver) {
-                window.__pddChatObserver.disconnect();
+    """只记录查询点击后的结果内容变化，忽略滚动和样式变化。"""
+    page.evaluate("""() => {
+        window.__pddChatObserver?.disconnect();
+        window.__pddChatMutationCount = 0;
+        window.__pddChatLastMutation = 0;
+        window.__pddChatQueryClicked = false;
+        window.__pddChatObserver = new MutationObserver(records => {
+            if (!window.__pddChatQueryClicked) return;
+            const relevant = records.some(record => {
+                const element = record.target.nodeType === 1
+                    ? record.target : record.target.parentElement;
+                return element?.closest('.search-order-sn-msg-table, .new-message-list')
+                    || Array.from(record.addedNodes).some(node => node.nodeType === 1 &&
+                        (node.matches('.search-order-sn-msg-table, .new-message-list') ||
+                         node.querySelector('.search-order-sn-msg-table, .new-message-list')));
+            });
+            if (relevant) {
+                window.__pddChatMutationCount++;
+                window.__pddChatLastMutation = performance.now();
             }
-
+        });
+        window.__pddChatObserver.observe(document.body, {
+            childList: true, subtree: true, characterData: true
+        });
+    }""")
+    get_query_button(page).evaluate("""button => {
+        button.addEventListener('click', () => {
+            window.__pddChatQueryClicked = true;
             window.__pddChatMutationCount = 0;
-
-            const resultPanel =
-                document.querySelector(
-                    ".search-order-sn-msg-table"
-                );
-
-            const target =
-                resultPanel
-                || document.querySelector(".search-content")
-                || document.body;
-
-            window.__pddChatObserver =
-                new MutationObserver(() => {
-                    window.__pddChatMutationCount += 1;
-                });
-
-            window.__pddChatObserver.observe(
-                target,
-                {
-                    childList: true,
-                    subtree: true,
-                    characterData: true,
-                    attributes: true,
-                }
-            );
-        }
-        """
-    )
+            window.__pddChatLastMutation = performance.now();
+        }, {capture: true, once: true});
+    }""")
 
 
-def wait_for_query_result(
-    page: Page,
-    old_signature: str,
-) -> None:
-    """等待查询完成并等待聊天记录渲染。"""
-
+def wait_for_query_result(page: Page, old_signature: str, timeout: int = 30_000) -> None:
+    """等待本次查询产生可见且稳定的结果；超时禁止采集旧内容。"""
     try:
-        page.wait_for_function(
-            """
-            (oldText) => {
-                const mutationCount =
-                    window.__pddChatMutationCount || 0;
-
-                const panel =
-                    document.querySelector(
-                        ".search-order-sn-msg-table"
-                    );
-
-                const currentText =
-                    panel?.innerText?.trim() || "";
-
-                const hasMessages =
-                    document.querySelectorAll(
-                        ".new-message-list .message-item"
-                    ).length > 0;
-
-                const hasResultTitle =
-                    Array.from(
-                        document.querySelectorAll("*")
-                    ).some((element) => {
-                        return (
-                            element.children.length === 0
-                            && element.textContent?.trim()
-                            === "查询结果"
-                        );
-                    });
-
-                return (
-                    mutationCount > 0
-                    || currentText !== oldText
-                    || hasMessages
-                    || hasResultTitle
-                );
-            }
-            """,
-            arg=old_signature,
-            timeout=30_000,
-        )
-
-    except PlaywrightTimeoutError:
-        # 超时很可能是验证码/弹窗把请求拦住了。这里如果闷头继续，
-        # 就会拿着一张陈旧的页面去采集，产出错的数据——比直接报错更糟。
-        # 所以先清障，清掉了就再等一轮真正的结果。
-        print("未检测到结果变化，检查是否有弹窗遮挡……")
-
-        clear_blockers(page)
-
-        try:
-            page.wait_for_function(
-                """
-                () => {
-                    const mutationCount =
-                        window.__pddChatMutationCount || 0;
-
-                    const hasMessages =
-                        document.querySelectorAll(
-                            ".new-message-list .message-item"
-                        ).length > 0;
-
-                    const hasBlankText =
-                        document.querySelector(
-                            ".search-order-sn-msg-table .table-blank-text"
-                        ) !== null;
-
-                    return (
-                        mutationCount > 0
-                        || hasMessages
-                        || hasBlankText
-                    );
-                }
-                """,
-                timeout=30_000,
-            )
-
-        except PlaywrightTimeoutError:
-            print(
-                "清障后仍未检测到结果变化，"
-                "继续读取当前页面结果。"
-            )
-
-    # 等待前端最后一批 DOM 渲染
-    jitter_wait(page, 1_000)
+        page.wait_for_function("""oldText => {
+            const visible = el => !!el && el.getClientRects().length > 0
+                && getComputedStyle(el).visibility !== 'hidden';
+            const panel = document.querySelector('.search-order-sn-msg-table');
+            const messages = Array.from(document.querySelectorAll(
+                '.new-message-list .message-item')).some(visible);
+            const empty = Array.from(document.querySelectorAll(
+                '.search-order-sn-msg-table .table-blank-text')).some(el =>
+                    visible(el) && el.textContent.includes('暂无聊天记录'));
+            const loading = Array.from(document.querySelectorAll(
+                '[aria-busy="true"], [data-testid="beast-core-loading"], .ant-spin-spinning'
+            )).some(visible);
+            return window.__pddChatQueryClicked
+                && window.__pddChatMutationCount > 0
+                && performance.now() - window.__pddChatLastMutation >= 1000
+                && !loading && (messages || empty);
+        }""", arg=old_signature, timeout=timeout).dispose()
+    except PlaywrightTimeoutError as exc:
+        clicked = page.evaluate('Boolean(window.__pddChatQueryClicked)')
+        raise RuntimeError(
+            f"聊天查询未确认新结果（查询按钮点击事件={clicked}），已停止本单采集，避免读取旧聊天记录。"
+        ) from exc
+    finally:
+        page.evaluate('() => window.__pddChatObserver?.disconnect()')
 
 
 # ============================================================
@@ -560,7 +513,7 @@ def get_expected_message_total(page: Page) -> int | None:
     return int(matched.group(1))
 
 
-def click_next_page(page: Page) -> dict:
+def click_next_page(page: Page, *, root_selector: str | None = None) -> dict:
     """
     点击分页组件中的下一页。
 
@@ -575,8 +528,13 @@ def click_next_page(page: Page) -> dict:
 
     result = page.evaluate(
         """
-        () => {
-            const root = document.querySelector(
+        (scopeSelector) => {
+            document.querySelectorAll("[data-pdd-chat-next-target]")
+                .forEach(element => element.removeAttribute(
+                    "data-pdd-chat-next-target"
+                ));
+            const scope = scopeSelector ? document.querySelector(scopeSelector) : document;
+            const root = scope?.querySelector(
                 '[data-testid="beast-core-pagination"]'
             );
 
@@ -750,23 +708,41 @@ def click_next_page(page: Page) -> dict:
                 };
             }
 
-            clickable.scrollIntoView({
-                block: "center",
-                inline: "center",
-            });
-
-            clickable.click();
+            // JavaScript 只负责识别目标。真正点击在 Python 侧通过鼠标
+            // 移动、按下、松开完成，不再调用 element.click()。
+            clickable.setAttribute(
+                "data-pdd-chat-next-target",
+                "true"
+            );
 
             return {
-                clicked: true,
-                reason: "已点击下一页",
+                clicked: false,
+                targetFound: true,
+                reason: "已识别下一页按钮",
                 description:
                     getDescription(clickable),
             };
         }
-        """
+        """,
+        arg=root_selector,
     )
 
+    if not result.get("targetFound"):
+        return result
+
+    target = page.locator('[data-pdd-chat-next-target="true"]')
+    try:
+        human_click(page, target)
+    finally:
+        try:
+            target.evaluate(
+                "element => element.removeAttribute('data-pdd-chat-next-target')"
+            )
+        except Exception:
+            pass
+
+    result["clicked"] = True
+    result["reason"] = "已用鼠标点击下一页"
     return result
 
 
@@ -830,7 +806,7 @@ def wait_for_next_page_loaded(
             """,
             arg=previous_signature,
             timeout=20_000,
-        )
+        ).dispose()
 
         # 等待当前页剩余内容渲染完成
         jitter_wait(page, 800)
@@ -1111,7 +1087,10 @@ def wait_for_chat_images(page: Page) -> None:
                     document.querySelectorAll(
                         ".new-message-list img"
                     )
-                );
+                ).filter((image) => {
+                    const rect = image.getBoundingClientRect();
+                    return rect.bottom > 0 && rect.top < window.innerHeight;
+                });
 
                 return images.every((image) => {
                     return (
@@ -1122,7 +1101,7 @@ def wait_for_chat_images(page: Page) -> None:
             }
             """,
             timeout=10_000,
-        )
+        ).dispose()
 
     except PlaywrightTimeoutError:
         print(
@@ -1136,12 +1115,12 @@ def save_page_evidence_screenshot(
     order_no: str,
     page_number: int,
     run_id: str,
-) -> Path:
+) -> list[dict]:
     """
-    保存当前分页的完整聊天记录截图。
+    像人工查看聊天一样逐屏滚动，只截聊天面板的当前可见区域。
 
-    截图前会临时展开聊天列表内部的滚动区域，
-    因此能够截取滚动条下面的全部聊天记录。
+    不展开 DOM、不截整页，也不做图片拼接。每张原始截图会记录它覆盖的
+    页内消息序号及完整可见范围，供后续优先选择一张、最多两张连续原图。
     """
 
     screenshot_dir = (
@@ -1155,11 +1134,6 @@ def save_page_evidence_screenshot(
         exist_ok=True,
     )
 
-    screenshot_path = (
-        screenshot_dir
-        / f"page_{page_number:03d}.png"
-    )
-
     message_list = page.locator(
         ".new-message-list"
     )
@@ -1169,54 +1143,215 @@ def save_page_evidence_screenshot(
         timeout=20_000,
     )
 
-    wait_for_chat_images(page)
+    message_list.evaluate(
+        """
+        (list) => {
+            const scrollable = (node) => {
+                const style = getComputedStyle(node);
+                return ["auto", "scroll", "overlay"].includes(style.overflowY)
+                    && node.scrollHeight > node.clientHeight + 2;
+            };
+            let node = list;
+            while (node && node !== document.body && !scrollable(node)) {
+                node = node.parentElement;
+            }
+            if (!node || node === document.body) node = list;
+            node.setAttribute("data-pdd-natural-chat-scroller", "true");
+            window.__pddNaturalChatScroller = node;
+            return {
+                clientHeight: node.clientHeight,
+                scrollHeight: node.scrollHeight,
+                scrollTop: node.scrollTop,
+            };
+        }
+        """,
+    )
 
-    try:
-        expand_info = expand_chat_scroll_area(page)
+    scroll_region = page.locator('[data-pdd-natural-chat-scroller="true"]')
+    box = scroll_region.bounding_box()
+    if not box:
+        raise RuntimeError("无法获取聊天区域的屏幕位置。")
 
-        before = expand_info.get("before", {})
-        after = expand_info.get("after", {})
+    viewport = page.viewport_size or {
+        "width": int(page.evaluate("window.innerWidth")),
+        "height": int(page.evaluate("window.innerHeight")),
+    }
+    center_x = box["x"] + box["width"] / 2
+    center_y = box["y"] + box["height"] / 2
+    page.mouse.move(center_x, center_y)
 
-        print(
-            "聊天滚动区域："
-            f'可见高度 {before.get("clientHeight", 0)}，'
-            f'内容总高度 {before.get("scrollHeight", 0)}'
+    # 从当前所在位置像真人一样滚回开头，不直接改 scrollTop。
+    safety = 0
+    while safety < 30:
+        top = page.evaluate("window.__pddNaturalChatScroller.scrollTop")
+        if top <= 1:
+            break
+        human_scroll(page, -min(max(int(top), 240), 720), 3, 7)
+        human_delay(120, 360)
+        safety += 1
+
+    captures: list[dict] = []
+    seen_ranges: set[tuple[int, int]] = set()
+    screen_number = 1
+    attempts = 0
+    stalled = 0
+
+    while screen_number <= 80 and attempts < 120:
+        attempts += 1
+        wait_for_chat_images(page)
+        human_delay(350, 1100)
+
+        visible_info = page.locator(
+            ".new-message-list .message-item"
+        ).evaluate_all(
+            """
+            (items) => {
+                const scroller = window.__pddNaturalChatScroller;
+                const view = scroller.getBoundingClientRect();
+                const visibleItems = items.map((item, index) => ({
+                    item,
+                    index: index + 1,
+                    rect: item.getBoundingClientRect(),
+                })).filter(({rect}) => (
+                    rect.bottom > view.top + 2
+                    && rect.top < view.bottom - 2
+                ));
+
+                // 保留发言人及时间，不能只保留有利气泡而丢失来源信息。
+                const contentRects = visibleItems.flatMap(({item}) => {
+                    const nodes = item.querySelectorAll(
+                        ".message-avatar, .message-name, .message-body, .message-time"
+                    );
+                    return Array.from(nodes).map(node => (
+                        node.getBoundingClientRect()
+                    )).filter(rect => (
+                        rect.width > 0 && rect.height > 0
+                        && rect.bottom > view.top
+                        && rect.top < view.bottom
+                    ));
+                });
+
+                if (!visibleItems.length || !contentRects.length) {
+                    return {indices: [], bounds: null};
+                }
+                return {
+                    indices: visibleItems.map(({index}) => index),
+                    fullIndices: visibleItems.filter(({rect}) => (
+                        rect.top >= Math.max(0, view.top)
+                        && rect.bottom <= Math.min(window.innerHeight, view.bottom)
+                        && rect.left >= Math.max(0, view.left)
+                        && rect.right <= Math.min(window.innerWidth, view.right)
+                    )).map(({index}) => index),
+                    bounds: {
+                        left: Math.max(
+                            view.left,
+                            Math.min(...contentRects.map(rect => rect.left))
+                        ),
+                        top: Math.max(
+                            view.top,
+                            Math.min(...contentRects.map(rect => rect.top))
+                        ),
+                        right: Math.min(
+                            view.right,
+                            Math.max(...contentRects.map(rect => rect.right))
+                        ),
+                        bottom: Math.min(
+                            view.bottom,
+                            Math.max(...contentRects.map(rect => rect.bottom))
+                        ),
+                    },
+                };
+            }
+            """
         )
+        visible = visible_info["indices"]
+        if not visible:
+            raise RuntimeError("聊天区域可见，但没有识别到当前屏幕中的消息。")
 
-        print(
-            "展开后的区域："
-            f'可见高度 {after.get("clientHeight", 0)}，'
-            f'内容总高度 {after.get("scrollHeight", 0)}'
-        )
-
-        # 等待网页重新排版稳定
-        jitter_wait(page, 800)
-
-        page.screenshot(
-            path=str(screenshot_path),
-            full_page=True,
-            animations="disabled",
-            scale="css",
-        )
-
-        print(
-            f"第 {page_number} 页完整凭证截图："
-            f"{screenshot_path}"
-        )
-
-        return screenshot_path
-
-    finally:
-        # 即使截图失败也要恢复网页，否则会影响翻页
-        try:
-            restore_chat_scroll_area(page)
-            jitter_wait(page, 300)
-
-        except Exception as restore_error:
-            print(
-                "恢复聊天区域样式失败："
-                f"{restore_error}"
+        message_range = (min(visible), max(visible))
+        if message_range not in seen_ranges:
+            seen_ranges.add(message_range)
+            # 按当前屏幕实际气泡的外接范围框选，而不是复用固定面板尺寸。
+            # 四边余量彼此独立，让短消息、长消息、左右对话自然得到不同
+            # 宽高；只增加空白，不侵入气泡，所以不会为了“不工整”截字。
+            bounds = visible_info["bounds"]
+            left = max(0, bounds["left"] - random.randint(8, 30))
+            top = max(0, bounds["top"] - random.randint(4, 28))
+            right = min(
+                viewport["width"],
+                bounds["right"] + random.randint(5, 22),
             )
+            bottom = min(
+                viewport["height"],
+                bounds["bottom"] + random.randint(8, 35),
+            )
+            screenshot_path = screenshot_dir / (
+                f"page_{page_number:03d}_screen_{screen_number:03d}_"
+                f"msg_{message_range[0]:03d}-{message_range[1]:03d}.png"
+            )
+            page.screenshot(
+                path=str(screenshot_path),
+                clip={
+                    "x": left,
+                    "y": top,
+                    "width": max(1, right - left),
+                    "height": max(1, bottom - top),
+                },
+                animations="disabled",
+                scale="css",
+            )
+            captures.append({
+                "path": screenshot_path,
+                "start": message_range[0],
+                "end": message_range[1],
+                "full_indices": visible_info.get("fullIndices", []),
+                "includes_time": True,
+            })
+            print(
+                f"第 {page_number} 页聊天区域截图 {screen_number}："
+                f"消息 {message_range[0]}-{message_range[1]}，{screenshot_path}"
+            )
+            screen_number += 1
+
+        state = page.evaluate(
+            """
+            () => {
+                const node = window.__pddNaturalChatScroller;
+                return {
+                    top: node.scrollTop,
+                    max: Math.max(0, node.scrollHeight - node.clientHeight),
+                    height: node.clientHeight,
+                };
+            }
+            """
+        )
+        if state["top"] >= state["max"] - 2:
+            break
+
+        distance = int(state["height"] * random.uniform(0.65, 0.84))
+        previous_top = state["top"]
+        human_scroll(page, max(180, distance), 4, 9)
+        if random.random() < 0.12:
+            human_delay(100, 260)
+            human_scroll(page, -random.randint(35, 90), 2, 4)
+        human_delay(450, 1350)
+        new_top = page.evaluate("window.__pddNaturalChatScroller.scrollTop")
+        stalled = stalled + 1 if new_top <= previous_top + 1 else 0
+        if stalled >= 3:
+            print("聊天区域连续三次没有滚动，停止当前页截图。")
+            break
+
+    page.evaluate(
+        """
+        () => {
+            window.__pddNaturalChatScroller?.removeAttribute(
+                "data-pdd-natural-chat-scroller"
+            );
+            delete window.__pddNaturalChatScroller;
+        }
+        """
+    )
+    return captures
 
 def collect_all_chat_records(
     page: Page,
@@ -1307,7 +1442,7 @@ def collect_all_chat_records(
         )
 
         # 先保存当前页截图
-        screenshot_path = (
+        screenshot_captures = (
             save_page_evidence_screenshot(
                 page=page,
                 order_no=order_no,
@@ -1325,14 +1460,33 @@ def collect_all_chat_records(
         )
 
         # JSON 中保存截图相对路径
-        relative_screenshot_path = (
-            to_relative_evidence_path(screenshot_path)
-        )
-
         for record in page_records:
-            record["evidence_screenshot"] = (
-                relative_screenshot_path
+            page_index = int(record.get("page_index") or 0)
+            matching = next(
+                (
+                    capture for capture in screenshot_captures
+                    if capture["start"] <= page_index <= capture["end"]
+                ),
+                screenshot_captures[0] if screenshot_captures else None,
             )
+            if matching:
+                record["evidence_screenshot"] = to_relative_evidence_path(
+                    matching["path"]
+                )
+        if page_records:
+            page_records[0]["page_evidence_details"] = [
+                {
+                    "path": to_relative_evidence_path(capture["path"]),
+                    "page": current_page,
+                    "full_indices": capture.get("full_indices", []),
+                    "includes_time": capture.get("includes_time", False),
+                }
+                for capture in screenshot_captures
+            ]
+            page_records[0]["page_evidence_screenshots"] = [
+                to_relative_evidence_path(capture["path"])
+                for capture in screenshot_captures
+            ]
 
         print(
             f"第 {current_page} 页采集完成，"
@@ -1352,13 +1506,11 @@ def collect_all_chat_records(
             )
             break
 
-        # 翻页的点击发生在 JS 内部，会绕过遮挡直接派发事件、不抛错，
-        # 但后续的数据刷新仍可能被风控拦住，所以要先清障再翻页。
+        # 翻页前先清障；按钮由 DOM 属性识别，实际动作使用鼠标移动和点击。
         clear_blockers(page)
 
         next_result = click_next_page(page)
 
-        # JS 内部直接调 el.click()，没有触发 mouse 事件；
         # 翻页后加一段随机延迟，模拟用户翻页→等加载→继续阅读的自然节奏
         human_delay(600, 1500)
 
@@ -1448,6 +1600,10 @@ def query_chat_records(
     if not order_no:
         raise ValueError("订单编号不能为空。")
 
+    # 每单从新文档查询，清除上一单内容及分页/滚动状态。
+    page.goto(START_URL, wait_until="domcontentloaded", timeout=30_000)
+    clear_blockers(page)
+
     select_order_search_mode(page)
 
     fill_order_number(
@@ -1471,11 +1627,10 @@ def query_chat_records(
 
     print(f"正在查询订单：{order_no}")
 
-    safe_click(
-        page=page,
-        locator=query_button,
-        description="查询按钮",
-    )
+    clear_blockers(page)
+    query_button.scroll_into_view_if_needed(timeout=8000)
+    # Locator.click 会检查遮挡、稳定性和实际可点击性，失败直接停止。
+    query_button.click(timeout=8000)
 
     # 点击查询会触发后端请求，是验证码高发时机
     clear_blockers(page)
@@ -1541,6 +1696,44 @@ def print_chat_records(
         print("-" * 70)
 
 
+def build_chat_record_dict(
+    order_no: str,
+    records: list[dict],
+    no_chat_record_screenshot: Path | None = None,
+    issue_type: str = "",
+) -> dict:
+    """把聊天记录拼成 save_chat_records() 原来写进 JSON 文件的那个 dict。
+
+    纯内存计算，不碰磁盘——从 save_chat_records() 里抽出来，供它自己（继续
+    写 chat_<订单号>.json，独立调试工具在用）和 run_appeal_batch.py 的
+    process_single_order()（改成直接写数据库，不落这份 JSON）共用，避免
+    两处重复拼 evidence_screenshots 列表。
+
+    no_chat_record_screenshot：订单查询结果为"暂无聊天记录"时的
+    凭证截图路径；订单确实有聊天记录时传 None。
+    issue_type：订单问题类型（"商品问题"/"服务问题"），从申诉列表表格采集。
+    """
+    evidence_screenshots: list[str] = []
+    for record in records:
+        evidence_screenshots.extend(record.get("page_evidence_screenshots") or [])
+        if record.get("evidence_screenshot"):
+            evidence_screenshots.append(record["evidence_screenshot"])
+    evidence_screenshots = list(dict.fromkeys(evidence_screenshots))
+
+    if no_chat_record_screenshot is not None:
+        evidence_screenshots.append(
+            to_relative_evidence_path(no_chat_record_screenshot)
+        )
+
+    return {
+        "order_no": order_no,
+        "issue_type": issue_type,
+        "message_count": len(records),
+        "evidence_screenshots": evidence_screenshots,
+        "messages": records,
+    }
+
+
 def save_chat_records(
     order_no: str,
     records: list[dict],
@@ -1550,9 +1743,10 @@ def save_chat_records(
     """
     将聊天记录保存成 JSON 文件。
 
-    no_chat_record_screenshot：订单查询结果为"暂无聊天记录"时的
-    凭证截图路径；订单确实有聊天记录时传 None。
-    issue_type：订单问题类型（"商品问题"/"服务问题"），从申诉列表表格采集。
+    只剩独立调试工具（本文件自己的 main()、appeal_classifier.py 的
+    batch_from_output_dir() 兼容兜底）在用；main.py 批量流水线已经改成
+    直接写数据库（见 run_appeal_batch.py 的 process_single_order()），
+    不再落这份 chat_<订单号>.json。
     """
 
     OUTPUT_DIR.mkdir(
@@ -1566,26 +1760,9 @@ def save_chat_records(
 
     output_file = OUTPUT_DIR / filename
 
-    evidence_screenshots = list(
-        dict.fromkeys(
-            record.get("evidence_screenshot", "")
-            for record in records
-            if record.get("evidence_screenshot")
-        )
+    result = build_chat_record_dict(
+        order_no, records, no_chat_record_screenshot, issue_type,
     )
-
-    if no_chat_record_screenshot is not None:
-        evidence_screenshots.append(
-            to_relative_evidence_path(no_chat_record_screenshot)
-        )
-
-    result = {
-        "order_no": order_no,
-        "issue_type": issue_type,
-        "message_count": len(records),
-        "evidence_screenshots": evidence_screenshots,
-        "messages": records,
-    }
 
     output_file.write_text(
         json.dumps(

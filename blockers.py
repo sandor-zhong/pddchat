@@ -15,8 +15,11 @@ stealth_safe_click——两者都是"点击 + 清障"的横切工具，理应共
 from __future__ import annotations
 
 from datetime import datetime
+import json
+import os
 
 from playwright.sync_api import (
+    Error as PlaywrightError,
     Locator,
     Page,
     TimeoutError as PlaywrightTimeoutError,
@@ -29,8 +32,7 @@ from captcha import (
     is_captcha_visible,
 )
 from paths import DEBUG_DIR
-from stealth import human_delay, jitter_wait
-
+from stealth import human_click, human_delay, jitter_wait
 
 # 任何 beast-core 弹窗都可能盖在按钮上，让点击打不中。
 # data-testid 不带版本哈希，是稳定锚点。
@@ -81,7 +83,8 @@ def dismiss_notification_modal(page: Page) -> bool:
             closer = modal.locator(selector)
             if closer.count() == 0 or not closer.first.is_visible():
                 continue
-            closer.first.click(timeout=5_000)
+            human_click(page, closer.first)
+            modal.wait_for(state="hidden", timeout=5000)
             jitter_wait(page, 500)
             print(f"已自动关闭挡住操作的弹窗（{selector}）。")
             return True
@@ -122,6 +125,114 @@ def dump_blocker(page: Page, reason: str) -> None:
         traceback.print_exc()
 
 
+def save_click_diagnostics(
+    page: Page, locator: Locator, description: str, attempt: int, error: Exception,
+) -> str | None:
+    """每次失败立即留存现场；采集异常不覆盖原始点击错误，也不操作页面。"""
+    data = {
+        "description": description, "attempt": attempt,
+        "error_type": type(error).__name__, "original_error": str(error),
+        "observed_at": datetime.now().isoformat(timespec="milliseconds"),
+        "observation_note": "状态采样于点击失败后；命中测试为元素中心，未必是实际点击点。",
+        "capture_errors": {},
+    }
+    try:
+        folder = DEBUG_DIR / "click_diagnostics"
+        folder.mkdir(parents=True, exist_ok=True)
+        stem = folder / f"click_{datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}_{attempt}"
+    except Exception as exc:
+        print(f"[点击诊断] 无法创建诊断目录：{exc}")
+        return None
+
+    def capture(name, action):
+        try:
+            data[name] = action()
+        except Exception as exc:
+            data["capture_errors"][name] = str(exc)
+
+    capture("url", lambda: page.url)
+    capture("locator", lambda: str(locator))
+    capture("targets", lambda: locator.evaluate_all("""elements => ({
+        count: elements.length,
+        samples: elements.slice(0, 5).map(el => {
+            const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
+            const x = rect.x + rect.width / 2, y = rect.y + rect.height / 2;
+            const hit = el.ownerDocument.elementFromPoint(x, y);
+            const summary = node => node ? {
+                tag: node.tagName, id: node.id, class: node.className,
+                html: node.outerHTML.slice(0, 8192)
+            } : null;
+            return {
+                target: summary(el), connected: el.isConnected,
+                rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+                has_client_rects: Boolean(el.getClientRects().length),
+                display: style.display, visibility: style.visibility,
+                opacity: style.opacity, pointer_events: style.pointerEvents,
+                disabled: el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true',
+                data_disabled: el.getAttribute('data-disabled'),
+                viewport: {width: window.innerWidth, height: window.innerHeight},
+                center_hit: summary(hit), center_hits_target: Boolean(hit && (hit === el || el.contains(hit))),
+                animations: el.getAnimations().map(a => ({play_state: a.playState}))
+            };
+        })
+    })"""))
+    capture("dropdowns", lambda: page.locator('[data-testid="beast-core-portal"]').evaluate_all("""nodes =>
+        nodes.slice(0, 10).map(el => ({
+            visible: Boolean(el.getClientRects().length) && getComputedStyle(el).visibility !== 'hidden',
+            html: el.outerHTML.slice(0, 65536)
+        }))"""))
+    screenshot = stem.with_suffix(".png")
+
+    def capture_screenshot():
+        page.screenshot(path=str(screenshot), full_page=False, timeout=3000)
+        return str(screenshot)
+
+    capture("screenshot", capture_screenshot)
+    html_path = stem.with_suffix(".html")
+    try:
+        sections = [item["html"] for item in data.get("dropdowns", [])]
+        sections += [item["target"]["html"] for item in data.get("targets", {}).get("samples", [])]
+        html_path.write_text("\n<hr>\n".join(sections), encoding="utf-8")
+        data["html_path"] = str(html_path)
+    except Exception as exc:
+        data["capture_errors"]["html"] = str(exc)
+    report = stem.with_suffix(".json")
+    try:
+        report.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"[点击诊断] 无法保存诊断报告：{exc}")
+        return None
+    print(f"[点击诊断] 第 {attempt} 次失败现场：{report}")
+    return str(report)
+
+
+def _click_failure(description: str, attempts: int, error: Exception, report: str | None) -> RuntimeError:
+    return RuntimeError(
+        f"点击【{description}】未完成：尝试 {attempts} 次后失败。"
+        f"原始错误：{type(error).__name__}: {error}"
+        + (f"；点击诊断：{report}" if report else "")
+    )
+
+
+def dismiss_new_message_popup(page: Page) -> bool:
+    """关闭右侧新消息浮层，只点击其标题栏的关闭图标。"""
+    # 消息浮层可能在全屏模态框下方，不能先点被遮挡的关闭图标。
+    if find_blocking_modal(page) is not None:
+        return False
+    popup = page.locator('#umd-msgbox-handler:visible')
+    if not popup.count():
+        return False
+    closer = popup.locator(
+        '[class*="ImportantList_msgbox-header"] [class*="ImportantList_close"]'
+    )
+    if closer.count() != 1 or not closer.is_visible():
+        raise RuntimeError("新消息浮层遮挡页面，但无法定位唯一关闭按钮。")
+    closer.click(timeout=5000)
+    popup.wait_for(state="hidden", timeout=5000)
+    print("已关闭新消息浮层。")
+    return True
+
+
 def clear_blockers(
     page: Page,
     timeout: int = CAPTCHA_WAIT_TIMEOUT,
@@ -139,11 +250,13 @@ def clear_blockers(
         ensure_no_captcha(page, timeout=timeout)
         return
 
-    if find_blocking_modal(page) is None:
-        return
-
-    if dismiss_notification_modal(page):
-        return
+    # 按层级清理：先移除模态遮罩，再处理右侧消息浮层。
+    for _ in range(5):
+        if find_blocking_modal(page) is None:
+            dismiss_new_message_popup(page)
+            return
+        if not dismiss_notification_modal(page):
+            break
 
     dump_blocker(page, reason="无法自动关闭的弹窗")
 
@@ -171,6 +284,7 @@ def clear_blockers(
         ) from err
 
     jitter_wait(page, 500)
+    dismiss_new_message_popup(page)
     print("弹窗已处理，继续执行。")
     print()
 
@@ -196,6 +310,7 @@ def safe_click(
     误判为通知型弹窗关掉。那种场景用 stealth_safe_click。
     """
     last_error: Exception | None = None
+    report = None
 
     for attempt in range(1, retries + 1):
         clear_blockers(page)
@@ -203,20 +318,23 @@ def safe_click(
         human_delay(80, 250)
 
         try:
-            locator.click(timeout=timeout)
+            locator.wait_for(state="visible", timeout=timeout)
+            human_click(page, locator)
             return
         except PlaywrightTimeoutError as error:
             last_error = error
+            report = save_click_diagnostics(page, locator, description, attempt, error)
             print(
                 f"点击【{description}】第 {attempt} 次未成功，"
-                "检查是否有弹窗遮挡……"
+                f"原始错误：{error}"
             )
+        except PlaywrightError as error:
+            report = save_click_diagnostics(page, locator, description, attempt, error)
+            raise _click_failure(description, attempt, error, report) from error
 
-    dump_blocker(page, reason=f"点击 {description} 始终失败")
-
-    raise RuntimeError(
-        f"点击【{description}】失败：重试 {retries} 次后仍被遮挡或不可点击。"
-    ) from last_error
+    if last_error is None:
+        raise ValueError("点击重试次数必须大于0。")
+    raise _click_failure(description, retries, last_error, report) from last_error
 
 
 def stealth_safe_click(
@@ -234,21 +352,27 @@ def stealth_safe_click(
     模态框内部的单选、上传、提交等按钮点击。
     """
     last_error: Exception | None = None
+    report = None
 
     for attempt in range(1, retries + 1):
         # 模拟看到元素后的反应时间
         human_delay(80, 250)
 
         try:
-            locator.click(timeout=timeout)
+            locator.wait_for(state="visible", timeout=timeout)
+            human_click(page, locator)
             return
         except PlaywrightTimeoutError as error:
             last_error = error
+            report = save_click_diagnostics(page, locator, description, attempt, error)
             print(
                 f"点击【{description}】第 {attempt} 次未成功，"
-                "检查是否有弹窗遮挡……"
+                f"原始错误：{error}"
             )
+        except PlaywrightError as error:
+            report = save_click_diagnostics(page, locator, description, attempt, error)
+            raise _click_failure(description, attempt, error, report) from error
 
-    raise RuntimeError(
-        f"点击【{description}】失败：重试 {retries} 次后仍被遮挡或不可点击。"
-    ) from last_error
+    if last_error is None:
+        raise ValueError("点击重试次数必须大于0。")
+    raise _click_failure(description, retries, last_error, report) from last_error

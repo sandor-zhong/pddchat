@@ -28,6 +28,21 @@ START_URL = (
 # 项目根目录 —— 所有派生目录都以此为基准。
 BASE_DIR = Path(__file__).resolve().parent
 
+# 打包安装版会把 Chromium 浏览器二进制随包带走，放在跟这份源码同级的
+# browsers\ 目录下（见 packaging\build_runtime.ps1 用 PLAYWRIGHT_BROWSERS_
+# PATH 把浏览器下载到这个位置、packaging\pddchat.iss 把它一起打进安装包），
+# 这样同事装完之后双击就能用，不需要联网单独装一次浏览器。
+# Playwright 找浏览器二进制靠 PLAYWRIGHT_BROWSERS_PATH 这个环境变量
+# （官方支持的机制，不是自定义 hack）——这里只在这个目录确实存在时才设置，
+# 且用 setdefault 不覆盖：开发环境没有这个目录，或者哪天开发者自己显式
+# 设置过这个变量，都保持原来的行为（走 Playwright 默认的每用户缓存目录
+# %LOCALAPPDATA%\ms-playwright\）不受影响。是否要真的读这个环境变量是
+# Playwright 自己的驱动进程在真正打开浏览器时才做的事，这里只负责"提前
+# 把值摆好"，不需要关心调用时机早晚。
+_BUNDLED_BROWSERS_DIR = BASE_DIR / "browsers"
+if _BUNDLED_BROWSERS_DIR.is_dir():
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(_BUNDLED_BROWSERS_DIR))
+
 
 def _slugify_shop(raw: str) -> str:
     """把用户传入的 shop id 变成文件系统安全的目录名。

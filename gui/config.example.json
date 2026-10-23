@@ -1,0 +1,4 @@
+{
+    "pddchat_root": "..",
+    "pddchat_python": "../.venv/Scripts/python.exe"
+}

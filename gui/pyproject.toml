@@ -1,0 +1,24 @@
+[project]
+name = "pddchat-gui"
+version = "0.1.0"
+description = "运营人员桌面界面（总览仪表盘/店铺管理/运行控制/报表导出），独立于主项目的 3.12 自动化环境"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "PyQt5==5.15.9",
+    # PyQt5 的 Qt5 二进制打包在独立的 PyQt5-Qt5 包里，版本号跟 PyQt5 本身
+    # 不是强绑定的——不显式钉版本时 uv 会解析到最新的 5.15.19，但那个
+    # 版本在 PyPI 上只发了 manylinux/macOS wheel，没有 Windows wheel，
+    # `uv sync` 会直接报错找不到平台兼容的分发包。5.15.2 是实测确认有
+    # win_amd64 wheel 的版本，显式钉住绕开这个问题。
+    "PyQt5-Qt5==5.15.2",
+    "PyQtChart==5.15.6",
+    # 同上，PyQtChart-Qt5 也要显式钉到有 Windows wheel 的版本。
+    "PyQtChart-Qt5==5.15.2",
+    "openpyxl>=3.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.2",
+]

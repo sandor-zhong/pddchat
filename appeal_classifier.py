@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -9,7 +10,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from paths import OUTPUT_DIR
-
+from appeal_style import evidence_style
 
 # ============================================================
 # 基础配置
@@ -49,14 +50,25 @@ APPEAL_EVIDENCE_OPTIONS = [
     "消费者未表达商品问题",
 ]
 
-# 查询不到聊天记录时（订单和消费者之间没有任何聊天记录），
+# 本次查询不到聊天记录时（不代表其他渠道没有投诉或凭证），
 # 不经过大模型判断，直接固定使用"消费者未表达商品问题"和固定申诉文案。
 NO_CHAT_RECORD_LABEL = APPEAL_EVIDENCE_OPTIONS[2]
 
-NO_CHAT_RECORD_APPEAL_TEXT = (
-    "商品本身无质量问题，评价内容未提供有效凭证，"
-    "属于主观感受，平台应核实真实情况，避免误判。"
+NO_CHAT_RECORD_APPEAL_TEXTS = (
+    "本次查询未获取到该订单的聊天记录，暂无法据此核实具体争议。申请平台结合售后详情及已有凭证，复核本次负向体验判定。",
+    "本次未查询到该订单的聊天内容，暂无法核实买家反馈及店铺回应。申请平台结合售后详情和相关凭证，重新审核本次负向体验判定。",
+    "本次获取的材料中缺少该订单聊天记录，暂无法据此判断具体问题及责任。申请平台结合售后详情及其他已有材料，复核本次负向体验判定。",
 )
+# 保留旧常量名，供售后申诉等没有订单号的兼容调用使用。
+NO_CHAT_RECORD_APPEAL_TEXT = NO_CHAT_RECORD_APPEAL_TEXTS[0]
+
+
+def get_no_chat_appeal_text(order_no: str = "") -> str:
+    """按订单号稳定选择自然话术；同一订单重复运行不会来回变化。"""
+    if not order_no:
+        return NO_CHAT_RECORD_APPEAL_TEXT
+    digest = hashlib.sha256(order_no.encode("utf-8")).digest()
+    return NO_CHAT_RECORD_APPEAL_TEXTS[digest[0] % len(NO_CHAT_RECORD_APPEAL_TEXTS)]
 
 SYSTEM_PROMPT = f"""你是拼多多商家客服的助手，负责根据买家和客服的聊天记录，
 判断这笔订单在提交差评/纠纷申诉时应该选择哪一种"申诉凭证"。
@@ -87,50 +99,14 @@ SYSTEM_PROMPT = f"""你是拼多多商家客服的助手，负责根据买家和
 只输出选中选项的完整文字，不要输出编号、解释或其他任何内容。
 """
 
-APPEAL_TEXT_SYSTEM_PROMPT = f"""你是拼多多商家客服的助手，负责根据买家和客服的聊天记录，
-以及已经判断出的"申诉凭证"类型，撰写提交申诉时使用的申诉文案。
-
-聊天记录格式与上面一致（压缩 JSON，"m" 数组每项为 [角色, 内容]，
-B=买家，S=客服，SYS=系统消息）。
-
-三种申诉凭证类型说明：
-1. {APPEAL_EVIDENCE_OPTIONS[0]}
-2. {APPEAL_EVIDENCE_OPTIONS[1]}
-3. {APPEAL_EVIDENCE_OPTIONS[2]}
-
-核心原则：
-- 商品本身绝对没有质量问题，全文任何地方都不能承认或暗示商品有
-  问题；买家提到的任何"问题"，只能写成买家自己的反馈/反映/主观
-  感受/误解，不能当成已经查实的客观事实来写；
-- 立场完全站在商家一方，只挑选、突出对商家有利的事实（例如买家
-  没有提供凭证、买家只是咨询/误解商品或使用方式、商家已经解释清楚
-  或已履行客服应尽的义务、双方已有解决方案且买家未明确拒绝等），
-  对商家不利或含糊的信息一律不提、不写；
-- 尽量引用聊天记录里的具体细节（买家说了什么、有没有给凭证、商家
-  做了什么/怎么解释的），让文案言之有据、不空洞，再给出明确结论，
-  例如"商品无问题""属于消费者误解""问题未被证实""不应判责/
-  判罚""不存在未解决的纠纷"之类，结论要和聊天记录内容对应，不要
-  套用固定模板；
-- 语言客观、口语化、有说服力，不要出现"我认为""可能"等模糊表达，
-  不要出现任何对商家不利或模棱两可的措辞；
-- 严格控制在100个汉字以内（含标点），写作时就要控制好长度，不要
-  事后再删减；
-- 只输出申诉文案本身，不要输出编号、引号、解释或其他任何内容。
-
-参考话术（用于学习写作风格、结构和语气，不要照抄，要结合实际
-聊天记录重新撰写）：
-- 客户仅咨询充电问题，未提供任何故障凭证或明确反馈商品存在质量问题，我司已解释快充需搭配对应充电头，客户未再回应。商品无问题，属消费者误解使用方式。
-- 消费者反馈充电口歪了，我们已主动提出剪断退款，消费者同意并去拿剪刀，双方已达成一致处理方案，不存在未解决的纠纷。
-- 消费者使用转接头连接Type-C接口，非线材本身问题，商品支持正常传输，消费者误解操作方式，商品无质量问题。
-- 消费者仅反馈充不上电，但未提供任何有效凭证（如视频或照片）证明数据线存在质量问题，无法确认是商品问题还是使用环境或设备兼容性导致，属于消费者误解。
-- 商品详情页已明确标注除华为外其他品牌仅显示快充，消费者使用OPPO手机，充电显示正常，商品无问题，是消费者误解产品功能。
-- 客户仅口头说一根线是坏的，但未提供任何照片或视频凭证证明问题，属于主观描述，无法确认商品实际存在质量问题，平台不应仅凭单方陈述判责。
-- 消费者反馈数据线充电不稳定，我们已要求提供视频核实，但消费者未提供有效凭证。我们已主动提出剪断退款方案，消费者未拒绝，视为达成一致。
-- 商品详情页明确标注为6A快充线，需搭配快充头和手机协议才能触发快充。客户未提供任何充电视频或凭证证明线材有问题，仅凭主观感受说充电慢，属于误解商品功能。
-- 消费者在咨询时询问能否用华为充电头，我们明确回复支持，但消费者实际使用后反馈"坏了""不能用"，并未提供任何照片或视频凭证证明数据线本身存在质量问题，属于误解商品信息或使用不当导致的问题，并非商品本身缺陷。
-- 消费者未提供任何商品问题凭证，仅凭主观描述要求退款，属于误解商品信息。编织线材质本身具有纹理，非质量问题，且详情页已明确说明产品特性。
-- 客户只是咨询线连电脑不通电，没有提供任何视频或图片证明问题，也未明确说商品有质量问题，我们已主动要求提供凭证，但客户未回应，属于未表达商品问题，不应判罚。
-"""
+APPEAL_TEXT_SYSTEM_PROMPT = """你根据本订单聊天和申诉凭证类型撰写负向申诉描述。
+聊天为压缩JSON，m数组每项为[角色, 内容]，B=买家，S=客服，SYS=系统消息。
+本次针对负向体验判定，不是货款或运费申诉，也不要称为复议。
+有依据时解释规格或使用条件的理解分歧；仅有咨询时说明咨询内容；无法核实故障时
+说明哪些信息缺失，不强行声称商品无问题。申诉凭证类型仅为分类参考，不是核验结论。
+结尾可请求结合记录复核本次负向体验判定，不凭空请求退货、仅退款或运费返还。
+信息很少时宁可简短，不为凑字数重复表达。正文含标点不超过120字。
+""" + evidence_style(50, 110)
 
 
 # ============================================================
@@ -240,7 +216,7 @@ def analyze_chat_text(text: str, order_no: str = "") -> tuple[str, str]:
     compact_data = parse_chat_text(text, order_no=order_no)
 
     if not compact_data["m"]:
-        return NO_CHAT_RECORD_LABEL, NO_CHAT_RECORD_APPEAL_TEXT
+        return NO_CHAT_RECORD_LABEL, get_no_chat_appeal_text(order_no)
 
     label = classify_appeal_evidence(compact_data)
     appeal_text = generate_appeal_text(compact_data, label)
@@ -349,7 +325,7 @@ def classify_appeal_evidence(compact_data: dict) -> str:
 
 
 def generate_appeal_text(compact_data: dict, evidence_label: str) -> str:
-    """调用 DeepSeek，根据聊天记录和申诉凭证类型生成申诉文案（100字以内）。"""
+    """根据聊天记录和分类生成证据导向文案，最终限制在120字以内。"""
 
     user_payload = {
         "chat": compact_data,
@@ -367,7 +343,7 @@ def generate_appeal_text(compact_data: dict, evidence_label: str) -> str:
             {"role": "system", "content": APPEAL_TEXT_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        temperature=0.3,
+        temperature=0.2,
         max_tokens=200,
         extra_body={
             "thinking": {"type": "disabled"}
@@ -383,12 +359,17 @@ def generate_appeal_text(compact_data: dict, evidence_label: str) -> str:
         f"输出:{usage.completion_tokens}"
     )
 
-    if len(text) > 300:
+    if len(text) > 120:
         print(
-            f"警告：申诉文案超过300字（{len(text)}字），已自动截断："
+            f"警告：申诉文案超过120字（{len(text)}字），已自动截断："
             f"{text!r}"
         )
-        text = text[:300]
+        candidate = text[:120]
+        sentence_end = max(candidate.rfind(mark) for mark in "。！？")
+        if sentence_end >= 70:
+            text = candidate[:sentence_end + 1]
+        else:
+            text = candidate[:119].rstrip("，、；：") + "。"
 
     return text
 
@@ -407,13 +388,14 @@ def classify_order_file(input_file: Path) -> None:
     order_no = data["order_no"]
 
     if not data["messages"]:
+        no_chat_text = get_no_chat_appeal_text(order_no)
         print(
             f"订单 {order_no} 没有聊天记录，"
             "不经过大模型判断，使用固定申诉文案。"
         )
 
         data["appeal_evidence_classification"] = NO_CHAT_RECORD_LABEL
-        data["appeal_text"] = NO_CHAT_RECORD_APPEAL_TEXT
+        data["appeal_text"] = no_chat_text
 
         input_file.write_text(
             json.dumps(
@@ -428,7 +410,7 @@ def classify_order_file(input_file: Path) -> None:
             f"订单 {order_no} 分类结果：{NO_CHAT_RECORD_LABEL}"
             "（无聊天记录，未经过AI判断）"
         )
-        print(f"订单 {order_no} 申诉文案：{NO_CHAT_RECORD_APPEAL_TEXT}")
+        print(f"订单 {order_no} 申诉文案：{no_chat_text}")
         print("-" * 70)
         return
 

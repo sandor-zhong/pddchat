@@ -8,17 +8,33 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
+env/
+.uv-cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
 # Secrets
 .env
+.env.*
+!.env.example
+!.env.sample
 
 # IDE
 .idea/
 .vscode/
 .codebuddy/
+.claude/settings.local.json
+.claude/*.lock
 
 # Runtime data (browser profiles, logs, etc.)
 state/
+/gui/config.json
 
 # Runtime artifacts (order data, chat records, evidence screenshots, debug output)
 output/
@@ -29,3 +45,16 @@ debug/
 .python-version
 *.log
 *.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 打包产物：downloads/ 是缓存的 embeddable Python zip，stage/ 是构建过程
+# 的暂存目录（含真实 .env、两份完整运行时），output/ 是编译出的安装包 exe
+# ——stage/ 和 output/ 都可能带着真实的 DEEPSEEK_API_KEY/ARK_API_KEY，
+# 决不能被提交进版本库（见 docs/ 下打包相关文档的安全提示）。
+packaging/downloads/
+packaging/stage/
+packaging/output/
