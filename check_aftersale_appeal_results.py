@@ -506,9 +506,6 @@ def check_aftersale_appeal_results(
         next_button = page.locator('[data-testid="beast-core-pagination-next"]')
         if next_button.count() == 0 or _next_disabled(next_button.first):
             break
-        if submitted_since is None and page_number == max_pages:
-            truncated = True
-            break
         previous_rows = rows
         page.wait_for_timeout(query_interval_seconds * 1000)
         safe_click(page, next_button.first, "售后申诉结果下一页")

@@ -453,12 +453,10 @@ def generate_aftersale_description(
     if compact_chat is None or not compact_chat.get("m"):
         if appeal_item == FREIGHT_APPEAL_ITEM:
             return (
-                "本次查询未获取到该订单的聊天记录，暂无法确认退货原因及运费承担。"
-                "申请平台结合售后详情和已有凭证复核，退还核实后不应由商家承担的运费扣款。"
+                "这单具体为什么退货、双方怎么沟通的还不清楚，我们对这笔退货运费扣款有异议。"
             )
         return (
-            "本次查询未获取到该订单的聊天记录，暂无法核实具体商品争议。"
-            "申请平台结合售后详情和已有凭证复核本次申诉项，退还核实后不应扣除的款项。"
+            "这单的具体售后经过还不清楚，我们对这笔售后扣款有异议。"
         )
 
     payload = {

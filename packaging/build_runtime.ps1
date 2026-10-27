@@ -239,6 +239,7 @@ Copy-Item -Path $vcRedistCachedPath -Destination $vcRedistStagePath -Force
 Write-Host "==== 完成：$vcRedistStagePath ===="
 
 $guiPythonExe = Join-Path $RuntimeDir "gui\python.exe"
+& (Join-Path $PSScriptRoot 'prune_runtime.ps1')
 $smokeTestScript = Join-Path $StageDir "_pyqt5_smoke_test.py"  # 生成在 stage\ 下（已 gitignore），不污染 packaging\ 里要跟踪进版本库的脚本文件
 'from PyQt5.QtWidgets import QApplication' | Set-Content -Path $smokeTestScript -Encoding ASCII
 'QApplication([])' | Add-Content -Path $smokeTestScript -Encoding ASCII

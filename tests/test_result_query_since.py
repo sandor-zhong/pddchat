@@ -1,4 +1,5 @@
 import io
+from itertools import islice
 import tempfile
 import unittest
 from contextlib import ExitStack, redirect_stdout
@@ -16,6 +17,10 @@ SUBMITTED = "2026-10-19T16:00:00+00:00"
 
 
 class QueryTimeSettingsTests(unittest.TestCase):
+    def test_page_numbers_have_no_cap_with_or_without_time_filter(self):
+        for since in (None, SINCE):
+            self.assertEqual(list(islice(settings.page_numbers(1, since), 150)), list(range(1, 151)))
+
     def test_beijing_boundary_includes_equivalent_utc_timestamp(self):
         records = [
             {"id": "old", "submitted_at": "2026-10-19T15:59:59+00:00"},

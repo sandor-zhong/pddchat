@@ -14,6 +14,9 @@ env/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.hypothesis/
+.tox/
+.nox/
 .coverage
 .coverage.*
 htmlcov/
@@ -35,6 +38,18 @@ coverage.xml
 # Runtime data (browser profiles, logs, etc.)
 state/
 /gui/config.json
+# Local SQLite databases, including journal/WAL sidecars
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+# Downloaded browser runtimes and local browser profiles
+/browsers/
+/ms-playwright/
 
 # Runtime artifacts (order data, chat records, evidence screenshots, debug output)
 output/
@@ -51,10 +66,8 @@ debug/
 Thumbs.db
 Desktop.ini
 
-# 打包产物：downloads/ 是缓存的 embeddable Python zip，stage/ 是构建过程
-# 的暂存目录（含真实 .env、两份完整运行时），output/ 是编译出的安装包 exe
-# ——stage/ 和 output/ 都可能带着真实的 DEEPSEEK_API_KEY/ARK_API_KEY，
-# 决不能被提交进版本库（见 docs/ 下打包相关文档的安全提示）。
+# 打包缓存、暂存运行时及历史构建产物；正式安装包输出至根目录 dist/。
+# 仅提交 packaging/ 下的构建脚本和必要资源，不提交生成内容。
 packaging/downloads/
 packaging/stage/
 packaging/output/

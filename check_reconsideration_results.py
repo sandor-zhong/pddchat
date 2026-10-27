@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -54,7 +55,31 @@ def resolve_platform_result(result_cell_text: str) -> tuple[str, str, str | None
     return "复议结果待确认", raw, f"平台出现未知复议结果：{raw or '空白'}"
 
 
-def extract_reconsideration_rows_from_current_page(page: Page) -> list[dict[str, str]]:
+def extract_reconsideration_rows_from_current_page(
+    page: Page, *, previous_rows: list[dict[str, str]] | None = None,
+    timeout_ms: int = 45_000,
+) -> list[dict[str, str]]:
+    """不能把表格外框已出现当作数据已加载；等待业务行或明确空态。"""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        raise_if_login_page(page)
+        payload = _read_reconsideration_table(page)
+        if not payload.get("loading"):
+            rows = _parse_reconsideration_payload(payload)
+            if rows and rows != previous_rows:
+                return rows
+            if payload.get("empty") and not payload.get("rows"):
+                return []
+        remaining = int((deadline - time.monotonic()) * 1000)
+        if remaining <= 0:
+            raise RuntimeError(
+                f"复议结果列表等待 {timeout_ms / 1000:g} 秒后仍未就绪："
+                "页面仍在加载、数据不完整或翻页后仍是上一页，请稍后重试。"
+            )
+        page.wait_for_timeout(min(250, remaining))
+
+
+def _read_reconsideration_table(page: Page) -> dict:
     """按表头文字映射列，避免前端调整列顺序后读错状态。"""
     table = page.locator('[data-testid="beast-core-table"]').first
     table.wait_for(state="visible", timeout=20_000)
@@ -73,15 +98,34 @@ def extract_reconsideration_rows_from_current_page(page: Page) -> list[dict[str,
             ).map((row) => Array.from(
                 row.querySelectorAll('td[data-testid="beast-core-table-td"]')
             ).map((cell) => (cell.innerText || cell.textContent || '').trim()));
-            return {headers, rows};
+            const visible = node => {
+                const s = getComputedStyle(node), r = node.getBoundingClientRect();
+                return s.display !== 'none' && s.visibility !== 'hidden'
+                    && Number(s.opacity || 1) !== 0 && r.width > 0 && r.height > 0;
+            };
+            const scope = table.closest('[data-testid="beast-core-spin"]')
+                || table.parentElement || table;
+            const loading = Array.from(scope.querySelectorAll(
+                '[data-testid="beast-core-spin-mask"], [aria-busy="true"], '
+                + '[data-testid*="loading"], [class*="spinning"], [class*="Loading"]'
+            )).some(visible) || scope.getAttribute('aria-busy') === 'true';
+            const empty = Array.from(table.querySelectorAll('div, span, td')).some(
+                node => visible(node) && ['暂无数据', '暂无记录', '暂无复议记录',
+                    '没有符合条件的订单'].includes((node.innerText || '').trim())
+            );
+            return {headers, rows, loading, empty};
         }
         """
     )
+    return payload
+
+
+def _parse_reconsideration_payload(payload: dict) -> list[dict[str, str]]:
     headers = [str(value).strip() for value in payload.get("headers", [])]
     required = ["订单编号", "问题类型", "复议金额(元)", "复议时间", "复议结果"]
     missing = [header for header in required if header not in headers]
     if missing:
-        raise RuntimeError(f"复议记录表缺少字段：{'、'.join(missing)}")
+        return []
     indices = {header: headers.index(header) for header in required}
 
     extracted: list[dict[str, str]] = []
@@ -104,7 +148,8 @@ def extract_reconsideration_rows_from_current_page(page: Page) -> list[dict[str,
                 "refund_amount": refund_match.group(1) if refund_match else "",
             }
         )
-    return extracted
+    # Partial rows must not be mistaken for a finished page.
+    return extracted if len(extracted) == len(payload.get("rows", [])) else []
 
 
 def _normalized_amount(value: object) -> Decimal | None:
@@ -273,9 +318,10 @@ def check_reconsideration_results(
     updates: list[dict] = []
     used_keys: set[tuple[str, str]] = set()
     visited_pages: set[str] = set()
+    previous_rows = None
 
     for page_no in result_query_settings.page_numbers(max_pages, submitted_since):
-        rows = extract_reconsideration_rows_from_current_page(page)
+        rows = extract_reconsideration_rows_from_current_page(page, previous_rows=previous_rows)
         signature = _page_signature(rows)
         if signature in visited_pages:
             raise RuntimeError("复议记录分页出现重复页面，已停止以避免死循环")
@@ -337,14 +383,8 @@ def check_reconsideration_results(
         ).first
         if next_button.count() == 0 or _next_page_is_disabled(next_button):
             break
-        previous_body_text = page.locator(
-            'tbody[data-testid="beast-core-table-middle-tbody"]'
-        ).inner_text()
+        previous_rows = rows
         safe_click(page, next_button, "复议记录下一页")
-        _wait_for_page_changed(page, previous_body_text.strip())
-        jitter_wait(page, 900, 0.35)
-    else:
-        raise RuntimeError(f"复议记录翻页超过安全上限 {max_pages} 页")
 
     unmatched_local_count = len(local_records) - len(used_keys)
     if unmatched_local_count:

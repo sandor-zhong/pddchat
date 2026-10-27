@@ -40,8 +40,8 @@ class AppealWordingTest(unittest.TestCase):
         self.assertEqual(label, appeal_classifier.NO_CHAT_RECORD_LABEL)
         self.assertEqual(text, appeal_classifier.get_no_chat_appeal_text("test"))
         for text in appeal_classifier.NO_CHAT_RECORD_APPEAL_TEXTS:
-            self.assertIn("暂无法", text)
-            self.assertIn("售后详情", text)
+            self.assertNotIn("本次查询", text)
+            self.assertIn("有异议", text)
             self.assertNotIn("未收到", text)
             self.assertNotIn("没有相关图片", text)
             self.assertLessEqual(len(text), 120)
@@ -60,7 +60,7 @@ class AppealWordingTest(unittest.TestCase):
                 {"o": "test", "m": []}, "其他"
             )
         client.assert_not_called()
-        self.assertIn("暂无法", text)
+        self.assertNotIn("未获取到", text)
         self.assertIn("处罚", text)
         self.assertNotIn("消费者未反馈", text)
 
@@ -71,7 +71,7 @@ class AppealWordingTest(unittest.TestCase):
                     text = aftersale_appeal.generate_aftersale_description(
                         chat, "消费者未表达商品问题", item, "非以上申诉原因"
                     )
-                    self.assertIn("暂无法", text)
+                    self.assertNotIn("未获取到", text)
                     self.assertNotIn("商品无质量问题", text)
                     self.assertNotIn("属于消费者无理由退货", text)
         client.assert_not_called()

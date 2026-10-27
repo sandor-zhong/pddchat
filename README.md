@@ -14,7 +14,9 @@ uv sync
 
 Firefox 使用 Playwright 配套版本，普通安装的 Firefox 不能直接用于此项目。开发环境执行 `uv run playwright install firefox`；Firefox 安装包内已带配套浏览器。Firefox 的表单输入使用浏览器原生填充并校验完整内容；Chrome 保留原来的剪贴板粘贴。
 
-打包 Firefox 版：`packaging/build_runtime.ps1 -BrowserEngine firefox`、`packaging/stage_app.ps1`，随后给 Inno Setup 编译器传入 `/DFirefoxOnly`，只附带 Firefox 及必要辅助程序。
+默认打包：运行 `./packaging/build_installer.ps1`，自动裁剪暂存运行时、更新源码并生成精简安装包，输出至项目根目录 `dist/pddchatSetup-0.1.0-lite.exe`。首次打包需先运行 `./packaging/build_runtime.ps1` 准备运行时；编译器未自动找到时用 `-CompilerPath` 指定 `ISCC.exe` 路径。`dist/` 已被 Git 忽略。
+
+直接编译 `packaging/pddchat.iss` 也默认生成精简版到根目录 `dist/`。完整 Chromium 版需显式传入 `/DBundledBrowser`。Firefox 版：先运行 `packaging/build_runtime.ps1 -BrowserEngine firefox`、`packaging/stage_app.ps1`，随后给 Inno Setup 编译器传入 `/DFirefoxOnly`。
 
 项目根目录 `.env` 需要分别配置业务分析和字符验证码使用的密钥：
 

@@ -124,5 +124,6 @@ def same_submission(record: dict, platform_value: str, time_field: str, toleranc
 
 
 def page_numbers(max_pages: int, since: str | None):
-    # 有时间范围时以目标记录是否查齐/平台末页为结束条件，避免旧页数上限截断。
-    return count(1) if since is not None else range(1, max_pages + 1)
+    # 参数保留以兼容调用方；所有结果查询均不再按固定页数截断。
+    # 由调用方在查齐目标、平台末页或检测到分页异常时结束。
+    return count(1)

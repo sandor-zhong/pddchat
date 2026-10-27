@@ -5,7 +5,7 @@
 ;   2. .\packaging\stage_app.ps1         暂存应用源码（不含本机 .env / API 密钥）
 ;   3. 用 Inno Setup 6 的 ISCC.exe 编译本文件：
 ;        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\pddchat.iss
-;      产出：packaging\output\pddchatSetup-<版本号>.exe
+;      默认精简打包，产出：项目根目录 dist\pddchatSetup-<版本号>-lite.exe
 ;
 ; 安装包不包含构建机的 .env 和 API 密钥；升级安装沿用目标目录已有的
 ; .env，全新安装需自行配置。打包文件清单另行排除 .env，防止暂存残留泄漏。
@@ -40,6 +40,11 @@
 #define MyAppName "pddchat"
 #define MyAppDisplayName "拼多多申诉"
 #define MyAppVersion "0.1.0"
+#ifndef BundledBrowser
+#ifndef FirefoxOnly
+#define NoBundledBrowser
+#endif
+#endif
 ; ↑ 出新版本时这里要跟 pyproject.toml / gui/pyproject.toml 的 version 一起改。
 
 [Setup]
@@ -60,8 +65,16 @@ DefaultGroupName={#MyAppDisplayName}
 DisableProgramGroupPage=yes
 ; 不需要管理员权限，全程装在当前用户自己的目录下，不弹 UAC。
 PrivilegesRequired=lowest
-OutputDir=output
-OutputBaseFilename=pddchatSetup-{#MyAppVersion}
+OutputDir=..\dist
+#ifdef FirefoxOnly
+OutputBaseFilename=pddchatSetup-{#MyAppVersion}-firefox
+#else
+#ifdef NoBundledBrowser
+OutputBaseFilename=pddchatSetup-{#MyAppVersion}-lite
+#else
+OutputBaseFilename=pddchatSetup-{#MyAppVersion}-full
+#endif
+#endif
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
@@ -116,7 +129,7 @@ Source: "stage\app\*"; DestDir: "{app}\app"; Excludes: ".env,.env.*"; Flags: rec
 ; Playwright 自己"下载+解压是否完整"的记账，跟这里要修的依赖校验问题
 ; 无关，删掉它可能会让 Playwright 误以为浏览器没装完整、触发不必要的
 ; 重新下载或者报错——保守起见只动理解清楚、确认安全的这一个文件。
-; 编译时传 /DNoBundledBrowser 可生成不含浏览器的精简包。
+; 默认不含浏览器；显式传 /DBundledBrowser 才附带 Chromium。
 #ifdef FirefoxOnly
 Source: "stage\firefox_browsers\*"; DestDir: "{app}\app\browsers"; Excludes: "DEPENDENCIES_VALIDATED,.links\*"; Flags: recursesubdirs ignoreversion
 #else

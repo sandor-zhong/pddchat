@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import db
 from check_reconsideration_results import (
@@ -53,10 +53,48 @@ class ReconsiderationResultRulesTest(unittest.TestCase):
             ]],
         }
 
-        rows = extract_reconsideration_rows_from_current_page(page)
+        with patch('check_reconsideration_results.raise_if_login_page'):
+            rows = extract_reconsideration_rows_from_current_page(page)
         self.assertEqual(rows[0]["order_no"], "260802-628526989683681")
         self.assertEqual(rows[0]["refund_amount"], "3.00")
         self.assertEqual(rows[0]["result_cell_text"], "申诉成功\n返还金额：3.00元")
+
+    @patch('check_reconsideration_results.raise_if_login_page')
+    def test_waits_for_data_after_empty_table_shell(self, _login) -> None:
+        page = MagicMock()
+        payload = {
+            'headers': ['订单编号', '问题类型', '复议金额(元)', '复议时间', '复议结果'],
+            'rows': [['260802-1', '商品问题', '3', '2026-08-26 14:32:52', '申诉成功']],
+        }
+        with patch('check_reconsideration_results._read_reconsideration_table',
+                   side_effect=[{'headers': [], 'rows': []}, {**payload, 'loading': True}, payload]):
+            rows = extract_reconsideration_rows_from_current_page(page)
+        self.assertEqual(rows[0]['order_no'], '260802-1')
+        self.assertEqual(page.wait_for_timeout.call_count, 2)
+
+    @patch('check_reconsideration_results.raise_if_login_page')
+    def test_loading_does_not_count_as_empty_or_complete(self, _login) -> None:
+        with patch('check_reconsideration_results._read_reconsideration_table',
+                   return_value={'headers': [], 'rows': [], 'loading': True, 'empty': True}):
+            with self.assertRaisesRegex(RuntimeError, '仍未就绪'):
+                extract_reconsideration_rows_from_current_page(MagicMock(), timeout_ms=0)
+
+    @patch('check_reconsideration_results.raise_if_login_page')
+    def test_explicit_empty_state_is_accepted(self, _login) -> None:
+        with patch('check_reconsideration_results._read_reconsideration_table',
+                   return_value={'headers': [], 'rows': [], 'empty': True}):
+            self.assertEqual(extract_reconsideration_rows_from_current_page(MagicMock()), [])
+
+    @patch('check_reconsideration_results.raise_if_login_page')
+    def test_previous_page_is_not_processed_again(self, _login) -> None:
+        payload = {
+            'headers': ['订单编号', '问题类型', '复议金额(元)', '复议时间', '复议结果'],
+            'rows': [['260802-1', '商品问题', '3', '2026-08-26 14:32:52', '申诉成功']],
+        }
+        with patch('check_reconsideration_results._read_reconsideration_table', return_value=payload):
+            old = extract_reconsideration_rows_from_current_page(MagicMock())
+            with self.assertRaisesRegex(RuntimeError, '仍未就绪'):
+                extract_reconsideration_rows_from_current_page(MagicMock(), previous_rows=old, timeout_ms=0)
 
     def test_duplicate_order_uses_reconsideration_time_to_pick_unique_record(self) -> None:
         row = {

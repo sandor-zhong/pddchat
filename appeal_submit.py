@@ -767,7 +767,6 @@ def detect_detail_page_status(detail_page: Page) -> str:
 
     has_a_marker = STATUS_A_TEXT_MARKER in text_content
     has_b_marker = STATUS_B_CLASS_MARKER in class_list
-
     # 终态标记查表：已申诉/已超时/已驳回……这些详情页都没有"我要申诉"
     # 入口了，直接按标记返回对应状态码，调用方一律跳过、不填表。
     for marker, status_code in TERMINAL_STATUS_MARKERS.items():
