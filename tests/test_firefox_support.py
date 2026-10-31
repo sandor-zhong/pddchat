@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import time
 import unittest
@@ -119,6 +120,7 @@ class BrowserChoiceTests(unittest.TestCase):
         self.assertFalse(memory_monitor.is_browser_process("python.exe"))
 
 
+@unittest.skipUnless(os.environ.get("PDD_NATIVE_MOUSE_SMOKE") == "1", "requires an interactive Windows desktop")
 class FirefoxIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -134,7 +136,7 @@ class FirefoxIntegrationTests(unittest.TestCase):
             context = stealth.create_stealth_context(
                 self.playwright,
                 folder,
-                headless=True,
+                headless=False,
                 browser_engine="firefox",
                 native_properties=True,
             )
@@ -171,7 +173,7 @@ class FirefoxIntegrationTests(unittest.TestCase):
             context = stealth.create_stealth_context(
                 self.playwright,
                 folder,
-                headless=True,
+                headless=False,
                 browser_engine="firefox",
                 native_properties=False,
             )

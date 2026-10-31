@@ -100,6 +100,8 @@ def drag_slider(page: Page, angle: float, steps: int) -> tuple[float, float]:
 def open_browser(playwright, *, headless: bool, slow_mo: int, channel: str | None) -> Browser:
     """打开 Chromium；可选使用本机 Edge 或 Chrome 通道。"""
 
+    if headless:
+        raise ValueError("系统鼠标操作需要可见的浏览器窗口。")
     launch_options: dict[str, object] = {
         "headless": headless,
         "slow_mo": slow_mo,
@@ -126,9 +128,10 @@ def run_test(args: argparse.Namespace) -> None:
         )
 
         try:
-            page = browser.new_page(
-                viewport={"width": args.viewport_width, "height": args.viewport_height},
-            )
+            context = browser.new_context(no_viewport=True)
+            from native_mouse import install_system_mouse
+            install_system_mouse(context)
+            page = context.new_page()
             page.goto(html_path.as_uri(), wait_until="domcontentloaded")
 
             # 第一步：对页面中图片元素截图，用图片算法动态计算角度。

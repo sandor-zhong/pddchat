@@ -10,6 +10,27 @@ import reconsideration
 
 
 class AppealWordingTest(unittest.TestCase):
+    def test_compact_chat_keeps_available_times_without_inventing_missing_times(self):
+        data = {
+            "order_no": "test",
+            "messages": [
+                {"sender": "买***", "is_system_message": False,
+                 "content": "放假再联系", "image_urls": [], "time": "昨天 13:20"},
+                {"sender": "客服", "is_system_message": False,
+                 "content": "好的", "image_urls": []},
+                {"sender": "系统", "is_system_message": True,
+                 "content": "退款成功通知", "image_urls": [], "time": "2026-10-28 13:30"},
+                {"sender": "客服", "is_system_message": False,
+                 "content": "", "image_urls": [], "time": "2026-10-28 13:31"},
+            ],
+        }
+        self.assertEqual(appeal_classifier.compact_chat_json(data), {
+            "o": "test",
+            "m": [["B", "放假再联系", "昨天 13:20"], ["S", "好的"],
+                  ["SYS", "退款成功通知", "2026-10-28 13:30"]],
+        })
+        self.assertEqual(data["messages"][0]["time"], "昨天 13:20")
+
     def test_negative_and_reconsideration_share_style_and_fact_constraints(self):
         negative = appeal_classifier.APPEAL_TEXT_SYSTEM_PROMPT
         self.assertIn(evidence_style(50, 110), negative)
@@ -31,7 +52,7 @@ class AppealWordingTest(unittest.TestCase):
         payload = json.loads(args["messages"][1]["content"])
         self.assertEqual(payload["chat"], chat)
         self.assertEqual(payload["申诉凭证类型"], "消费者误解商品信息")
-        self.assertEqual(args["temperature"], 0.2)
+        self.assertEqual(args["temperature"], 0.65)
 
     def test_negative_no_chat_templates_stay_evidence_limited(self):
         with patch("appeal_classifier.get_client") as client:
@@ -41,7 +62,8 @@ class AppealWordingTest(unittest.TestCase):
         self.assertEqual(text, appeal_classifier.get_no_chat_appeal_text("test"))
         for text in appeal_classifier.NO_CHAT_RECORD_APPEAL_TEXTS:
             self.assertNotIn("本次查询", text)
-            self.assertIn("有异议", text)
+            self.assertIn("商家", text)
+            self.assertNotIn("复核", text)
             self.assertNotIn("未收到", text)
             self.assertNotIn("没有相关图片", text)
             self.assertLessEqual(len(text), 120)

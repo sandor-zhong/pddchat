@@ -1,5 +1,11 @@
 # 拼多多商家申诉批量处理工具
 
+## 提示词离线测试
+
+项目根目录提供 `test_negative_prompt.py`（负向）、`test_reconsideration_prompt.py`（复议）、`test_aftersale_prompt.py`（售后）三个入口。例：`.\.venv\Scripts\python.exe test_negative_prompt.py --count 20`，将 `20` 改为 `50` 可测试50单。默认测试当前正式提示词，自动输出新旧话术对比 Excel、原始聊天及提示词快照；不打开浏览器、不提交申诉、不写业务数据库。
+
+先用 `--list-only` 查看可用量。材料不足默认停止；加 `--allow-fewer` 按实际数量运行，或加 `--include-no-chat` 纳入正式兜底。自定义提示词、断点续跑和重新导出见[完整执行说明](docs/prompt_testing.md)。
+
 ## 环境准备
 
 ```bash
@@ -7,6 +13,10 @@ uv sync
 ```
 
 首次运行前需在 `state/` 目录下有已登录的浏览器 Profile。
+
+网页自动化的点击、移动、拖拽和滚轮统一使用 Windows 系统鼠标，用户能看到真实光标操作。Playwright 继续负责定位元素、读取页面和输入文字。运行时需要保持桌面解锁、浏览器可见，避免手动操作鼠标；多个任务的鼠标动作通过系统互斥锁串行执行。无法切换前台或目标被遮挡时会报错，不回退到浏览器虚拟鼠标。系统鼠标模式要求 `no_viewport=True`，不支持无头浏览器。
+
+开发验证：运行 `python -m unittest tests.test_native_mouse`；在可交互 Windows 桌面设置 `PDD_NATIVE_MOUSE_SMOKE=1` 后运行同一命令，还会打开本地测试页验证真实点击、滑块拖拽、滚轮和新标签页。
 
 运行控制页的“任务浏览器”可选择 Chrome / Chromium 或 Firefox。先停止任务及登录窗口后再切换；Chrome 保留原有目录，Firefox 登录状态保存在对应店铺目录的 `.firefox/` 中，首次切换需要重新登录。订单和申诉历史共用原数据库。
 

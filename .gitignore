@@ -37,6 +37,9 @@ coverage.xml
 
 # Runtime data (browser profiles, logs, etc.)
 state/
+!/gui/state/
+/gui/state/*
+!/gui/state/.gitkeep
 /gui/config.json
 # Local SQLite databases, including journal/WAL sidecars
 *.db
@@ -53,11 +56,14 @@ state/
 
 # Runtime artifacts (order data, chat records, evidence screenshots, debug output)
 output/
+/outputs/
 evidence/
 debug/
 
+# Node.js dependencies
+node_modules/
+
 # Misc tooling
-.python-version
 *.log
 *.tmp
 *.bak

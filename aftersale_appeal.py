@@ -25,6 +25,7 @@ from appeal_classifier import (
 from appeal_submit import wait_for_submit_captcha
 from chat_evidence import select_chat_evidence
 from appeal_wording import AFTERSALE_DESCRIPTION_PROMPT
+from appeal_style import diverse_completion
 from blockers import clear_blockers, safe_click, stealth_safe_click
 from paths import BASE_DIR, DEBUG_DIR, EVIDENCE_DIR, SHOP_ID
 from pdd_chat import (
@@ -54,8 +55,8 @@ GOODS_APPEAL_ITEM = "货款申诉"
 FREIGHT_APPEAL_ITEM = "运费申诉"
 GOODS_PREFERRED_REASON = "消费者反馈商品存在质量问题，但凭证不足"
 GOODS_FALLBACK_REASON = "非以上申诉原因"
-FREIGHT_REASON_PARENT = "退货运费"
-FREIGHT_REASON = "消费者无理由退货，退货运费不应商家承担"
+FREIGHT_REASON_PARENT = "其他"
+FREIGHT_REASON = "非以上申诉原因"
 SUPPORTED_APPEAL_ITEMS = {GOODS_APPEAL_ITEM, FREIGHT_APPEAL_ITEM}
 DISPUTE_APPEAL_ITEM = "纠纷退款率申诉"
 AFTERSALE_APPEAL_TITLES = ("维权申诉", "极速退款申诉")
@@ -453,10 +454,10 @@ def generate_aftersale_description(
     if compact_chat is None or not compact_chat.get("m"):
         if appeal_item == FREIGHT_APPEAL_ITEM:
             return (
-                "这单具体为什么退货、双方怎么沟通的还不清楚，我们对这笔退货运费扣款有异议。"
+                "这单暂无法确认退货原因，现有材料不能说明这笔退货运费扣款应由商家承担的具体依据。"
             )
         return (
-            "这单的具体售后经过还不清楚，我们对这笔售后扣款有异议。"
+            "现有材料没有具体售后经过，尚无法确认这笔售后扣款对应的商家责任。"
         )
 
     payload = {
@@ -465,7 +466,9 @@ def generate_aftersale_description(
         "申诉原因": appeal_reason,
         "已有聊天分析结论": classification,
     }
-    response = get_client().chat.completions.create(
+    response = diverse_completion(
+        get_client().chat.completions.create,
+        max_chars=300,
         model="deepseek-v4-flash",
         messages=[
             {"role": "system", "content": AFTERSALE_DESCRIPTION_PROMPT},
@@ -695,13 +698,30 @@ def save_reason_selection_diagnostics(
     return report
 
 
+def _ordered_appeal_sections(modal: Locator, appeal_item: str) -> list[tuple[int, str]]:
+    """使用页面勾选项的 DOM 顺序，而不是列表文字的顺序。"""
+    if not _is_combined_appeal(appeal_item):
+        return [(0, appeal_item)]
+    checked = modal.locator(
+        '[id="subInfoVOS"] [data-testid="beast-core-checkbox"][data-checked="true"]'
+    )
+    items = [_clean_text(checked.nth(i)) for i in range(checked.count())]
+    if len(items) != len(_appeal_items(appeal_item)) or set(items) != _appeal_items(appeal_item):
+        raise RuntimeError("无法确认表单各组申诉项及顺序，停止填写。")
+    return list(enumerate(items))
+
+
 def select_appeal_reason(
     detail_page: Page,
     modal: Locator,
     appeal_item: str,
+    *,
+    section_index: int | None = None,
+    section_item: str | None = None,
 ) -> str:
     try:
-        return _select_appeal_reason(detail_page, modal, appeal_item)
+        return _select_appeal_reason(detail_page, modal, appeal_item,
+                                    section_index=section_index, section_item=section_item)
     except Exception as error:
         try:
             save_reason_selection_diagnostics(detail_page, modal, appeal_item, error)
@@ -714,28 +734,42 @@ def _select_appeal_reason(
     detail_page: Page,
     modal: Locator,
     appeal_item: str,
+    *,
+    section_index: int | None = None,
+    section_item: str | None = None,
 ) -> str:
     """按申诉项和当前实际选项选择原因，并读回完整值校验。"""
     if not _supported_appeal_item(appeal_item):
         raise RuntimeError(f"暂不支持的售后申诉项：{appeal_item!r}")
-    container = modal.locator('[id="subInfoVOS[0].reason"]')
+    if section_index is None and _is_combined_appeal(appeal_item):
+        reasons = []
+        for index, item in _ordered_appeal_sections(modal, appeal_item):
+            container = modal.locator(f'[id="subInfoVOS[{index}].reason"]')
+            if not container.count():
+                continue
+            reasons.append(_select_appeal_reason(detail_page, modal, appeal_item,
+                                                section_index=index, section_item=item))
+        return "；".join(dict.fromkeys(reasons))
+    index = section_index if section_index is not None else 0
+    item = section_item or appeal_item
+    container = modal.locator(f'[id="subInfoVOS[{index}].reason"]')
     reason_input = container.locator(
         'input[data-testid="beast-core-cascader-htmlInput"]'
     )
     reason_input.wait_for(state="visible", timeout=10_000)
     current_value = reason_input.input_value().strip()
     combined = _is_combined_appeal(appeal_item)
-    is_goods = appeal_item == GOODS_APPEAL_ITEM or combined
+    is_goods = item == GOODS_APPEAL_ITEM
     # 同时包含货款和纠纷退款率申诉时，使用“非以上申诉原因”。
     goods_reason = (
         GOODS_FALLBACK_REASON
-        if {GOODS_APPEAL_ITEM, DISPUTE_APPEAL_ITEM} <= _appeal_items(appeal_item)
+        if combined
         else GOODS_PREFERRED_REASON
     )
     if is_goods and current_value == goods_reason:
         return goods_reason
     if (
-        appeal_item == FREIGHT_APPEAL_ITEM
+        item == FREIGHT_APPEAL_ITEM
         and FREIGHT_REASON_PARENT in current_value
         and FREIGHT_REASON in current_value
     ):
@@ -760,7 +794,7 @@ def _select_appeal_reason(
         actual = reason_input.input_value().strip()
         if actual != target:
             raise RuntimeError(
-                f"货款申诉原因读回校验失败：期望={target!r}，实际={actual!r}。"
+                f"第{index + 1}组货款申诉原因读回校验失败：期望={target!r}，实际={actual!r}。"
             )
         return target
 
@@ -777,8 +811,8 @@ def _select_appeal_reason(
     return FREIGHT_REASON
 
 
-def fill_maximum_amount(modal: Locator, page: Page | None = None) -> str:
-    container = modal.locator('[id="subInfoVOS[0].amount"]')
+def fill_maximum_amount(modal: Locator, page: Page | None = None, *, index: int = 0) -> str:
+    container = modal.locator(f'[id="subInfoVOS[{index}].amount"]')
     text = _clean_text(container)
     matched = re.search(r"最多可申诉\s*(\d+(?:\.\d{1,2})?)\s*元", text)
     if matched is None:
@@ -817,6 +851,9 @@ def _upload_images(
     if not valid:
         return []
     container = modal.locator(f'[id="{container_id}"]')
+    if not container.count():
+        container_id = container_id.replace('ImageUrls', 'VoucherUrls')
+        container = modal.locator(f'[id="{container_id}"]')
     file_input = container.locator(
         'input[data-testid="beast-core-upload-input"][accept*=".jpg"]'
     )
@@ -937,37 +974,56 @@ def fill_and_submit_aftersale_form(
     modal = open_aftersale_appeal_modal(detail_page)
     business_pause(detail_page, reading=True)
     verify_modal_context(modal, task)
-    appeal_reason = select_appeal_reason(
-        detail_page, modal, task["appeal_item"]
-    )
+    maximum = ""
+    reasons = []
+    evidence_sections = []
+    # 按页面顺序完成一整组后再向下操作，避免来回跳转各组字段。
+    for evidence_index, item in _ordered_appeal_sections(modal, task["appeal_item"]):
+        print(f"填写第{evidence_index + 1}组：{item}")
+        if modal.locator(f'[id="subInfoVOS[{evidence_index}].reason"]').count():
+            reasons.append(select_appeal_reason(
+                detail_page, modal, task["appeal_item"],
+                section_index=evidence_index, section_item=item,
+            ))
+        if modal.locator(f'[id="subInfoVOS[{evidence_index}].amount"]').count():
+            amount = fill_maximum_amount(modal, page=detail_page, index=evidence_index)
+            if not maximum:
+                maximum = amount
+        if not modal.locator(
+            f'[id="subInfoVOS[{evidence_index}].mustImageUrls"], '
+            f'[id="subInfoVOS[{evidence_index}].mustVoucherUrls"]'
+        ).count():
+            continue
+        required_files = _upload_images(
+            modal,
+            f"subInfoVOS[{evidence_index}].mustImageUrls",
+            [refund_application],
+            required=True,
+        )
+        optional_files = _upload_images(
+            modal,
+            f"subInfoVOS[{evidence_index}].optionalImageUrls",
+            chat_evidence,
+            required=False,
+        )
+        evidence_sections.append((required_files, optional_files))
+        wait_for_uploads(detail_page, modal)
+        if len(required_files) != 1 or len(optional_files) > 2:
+            raise RuntimeError(f"第{evidence_index + 1}组凭证数量校验失败，停止填写后续组。")
+    appeal_reason = "；".join(dict.fromkeys(reasons))
     appeal_text = generate_aftersale_description(
-        compact_chat,
-        classification,
-        task["appeal_item"],
-        appeal_reason,
+        compact_chat, classification, task["appeal_item"], appeal_reason,
     )
-    maximum = fill_maximum_amount(modal, page=detail_page)
-    evidence_index = 1 if _is_combined_appeal(task["appeal_item"]) else 0
-    required_files = _upload_images(
-        modal,
-        f"subInfoVOS[{evidence_index}].mustImageUrls",
-        [refund_application],
-        required=True,
-    )
-    optional_files = _upload_images(
-        modal,
-        f"subInfoVOS[{evidence_index}].optionalImageUrls",
-        chat_evidence,
-        required=False,
-    )
-    wait_for_uploads(detail_page, modal)
     fill_description(detail_page, modal, appeal_text)
 
     # 最终动作前做最后一次关键字段校验。
-    if len(required_files) != 1:
-        raise RuntimeError("必填凭证数量校验失败。")
-    if len(optional_files) > 2:
-        raise RuntimeError("聊天凭证最多上传两张。")
+    if not evidence_sections:
+        raise RuntimeError("未找到任何必填凭证区，停止提交。")
+    for evidence_index, (required_files, optional_files) in enumerate(evidence_sections):
+        if len(required_files) != 1:
+            raise RuntimeError(f"第{evidence_index + 1}组必填凭证数量校验失败。")
+        if len(optional_files) > 2:
+            raise RuntimeError(f"第{evidence_index + 1}组聊天凭证最多上传两张。")
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     form_path = DEBUG_DIR / (
         f"aftersale_form_filled_{safe_filename(order_no)}_"

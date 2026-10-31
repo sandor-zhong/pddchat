@@ -54,7 +54,12 @@ class CascaderBrowserTests(unittest.TestCase):
         self.page = self.browser.new_page()
         self.addCleanup(self.page.close)
 
-    def make_form(self, reasons):
+    def make_form(self, reasons, appeal_items="货款申诉、纠纷退款率申诉", second_reason=False):
+        checked = ''.join(
+            f'<label data-testid="beast-core-checkbox" data-checked="true">{name}</label>'
+            for name in ('货款申诉', '运费申诉', '纠纷退款率申诉')
+            if name in appeal_items
+        )
         items = "".join(
             '<li data-testid="beast-core-cascader-list-item" data-disabled="false">'
             '<div data-testid="beast-core-ellipsis"><div>'
@@ -64,19 +69,25 @@ class CascaderBrowserTests(unittest.TestCase):
         self.page.set_content('''
             <div id="modal">
             <div data-testid="beast-core-form-item"><span>申诉订单号</span><a>260902-651511733860402</a></div>
-            <div data-testid="beast-core-form-item"><span>申诉项</span><div id="subInfoVOS">货款申诉</div></div>
+            <div data-testid="beast-core-form-item"><span>申诉项</span><div id="subInfoVOS">''' + checked + '''</div></div>
             <div data-testid="beast-core-form-item"><span>申诉原因</span><div id="subInfoVOS[0].reason">
                 <input data-testid="beast-core-cascader-htmlInput" readonly>
-            </div></div></div>
+            </div></div>''' + (
+                '<div id="subInfoVOS[1].reason"><input data-testid="beast-core-cascader-htmlInput" readonly></div>'
+                if second_reason else ''
+            ) + '''</div>
             <div id="menu" data-testid="beast-core-portal" style="display:none">
                 <ul data-testid="beast-core-cascader-list-wrapper-0">''' + items + '''</ul>
             </div>
             <div data-testid="beast-core-portal" style="display:none">hidden portal</div>
             <script>
                 (() => {
-                const input = document.querySelector('input');
+                let input = document.querySelector('input');
                 const menu = document.querySelector('#menu');
-                input.onclick = () => menu.style.display = 'block';
+                document.querySelectorAll('input').forEach(field => field.onclick = () => {
+                    input = field;
+                    menu.style.display = 'block';
+                });
                 function wire(item, child) {
                     item.onmouseenter = () => {
                         document.querySelector('#tooltip')?.remove();
@@ -88,19 +99,19 @@ class CascaderBrowserTests(unittest.TestCase):
                         document.body.append(tip);
                     };
                     item.onclick = () => {
-                        if (item.innerText === '退货运费' && !child) {
+                        if (item.innerText === '其他' && !child) {
                             if (!menu.querySelector('[data-testid="beast-core-cascader-list-wrapper-1"]')) {
                                 const list = document.createElement('ul');
                                 list.dataset.testid = 'beast-core-cascader-list-wrapper-1';
                                 const option = document.createElement('li');
                                 option.dataset.testid = 'beast-core-cascader-list-item';
-                                option.textContent = '消费者无理由退货，退货运费不应商家承担';
+                                option.textContent = '非以上申诉原因';
                                 list.append(option);
                                 menu.append(list);
                                 wire(option, true);
                             }
                         } else {
-                            input.value = child ? '退货运费 / ' + item.innerText : item.innerText;
+                            input.value = child ? '其他 / ' + item.innerText : item.innerText;
                             menu.style.display = 'none';
                             document.querySelector('#tooltip')?.remove();
                         }
@@ -125,7 +136,7 @@ class CascaderBrowserTests(unittest.TestCase):
         cases = (
             (appeal.GOODS_APPEAL_ITEM, appeal.GOODS_PREFERRED_REASON),
             ("纠纷退款率申诉、货款申诉", appeal.GOODS_FALLBACK_REASON),
-            ("货款申诉、运费申诉", appeal.GOODS_PREFERRED_REASON),
+            ("货款申诉、运费申诉", appeal.GOODS_FALLBACK_REASON),
             ("运费申诉、货款申诉、纠纷退款率申诉", appeal.GOODS_FALLBACK_REASON),
         )
         for item, expected in cases:
@@ -133,7 +144,7 @@ class CascaderBrowserTests(unittest.TestCase):
                 modal = self.make_form([
                     "消费者反馈商品错发，但实际未错发",
                     appeal.GOODS_PREFERRED_REASON, appeal.GOODS_FALLBACK_REASON,
-                ])
+                ], appeal_items=item)
                 with patch.object(appeal, "stealth_safe_click", side_effect=self.hover_then_click):
                     result = appeal.select_appeal_reason(self.page, modal, item)
                 self.assertEqual(result, expected)
@@ -172,6 +183,14 @@ class CascaderBrowserTests(unittest.TestCase):
         with patch.object(appeal, "stealth_safe_click", side_effect=self.hover_then_click):
             result = appeal.select_appeal_reason(self.page, modal, appeal.FREIGHT_APPEAL_ITEM)
         self.assertEqual(result, appeal.FREIGHT_REASON)
+
+    def test_combined_two_fields_use_goods_leaf_and_freight_two_level_path(self):
+        modal = self.make_form([appeal.GOODS_FALLBACK_REASON, '其他'], appeal_items='货款申诉、运费申诉', second_reason=True)
+        with patch.object(appeal, 'stealth_safe_click', side_effect=self.hover_then_click):
+            result = appeal.select_appeal_reason(self.page, modal, '运费申诉、货款申诉')
+        self.assertEqual(result, '非以上申诉原因')
+        self.assertEqual(modal.locator('[id="subInfoVOS[0].reason"] input').input_value(), '非以上申诉原因')
+        self.assertEqual(modal.locator('[id="subInfoVOS[1].reason"] input').input_value(), '其他 / 非以上申诉原因')
 
     def test_zero_matches_collect_actual_item_and_available_reasons(self):
         modal = self.make_form([appeal.GOODS_PREFERRED_REASON])

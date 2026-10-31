@@ -147,19 +147,18 @@ class Collector:
                     if (!close) close = [...panel.querySelectorAll('i')]
                         .find(el => /close/i.test(el.className || ''));
                     if (close && visible(close)) {
-                        close.click();
-                        // React may animate the drawer after its X is clicked. Disable only this
-                        // known notice shell so it cannot keep intercepting the pending click.
-                        if (panel.id === 'umd-msgbox-handler') {
-                            panel.style.setProperty('display', 'none', 'important');
-                            const shell = panel.closest('section[class*="NewMsgBox_important-wrapper__"]');
-                            if (shell) shell.style.setProperty('display', 'none', 'important');
-                        }
+                        close.setAttribute('data-pdd-native-close', String(count));
                         count++;
                     }
                 }
                 return count;
             }""")
+            for index in range(dismissed):
+                target = self.page.locator(f'[data-pdd-native-close="{index}"]')
+                if target.count() and target.is_visible():
+                    target.click(timeout=3000)
+            self.page.locator('[data-pdd-native-close]').evaluate_all(
+                "els => els.forEach(el => el.removeAttribute('data-pdd-native-close'))")
             total += dismissed
             if not dismissed:
                 break

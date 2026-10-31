@@ -58,7 +58,7 @@ class WarnCenterCleanupTests(unittest.TestCase):
             "close_warn_center",
             playwright.chromium.launch_persistent_context.call_args.kwargs,
         )
-        context.on.assert_called_once()
+        self.assertEqual([call.args[0] for call in context.on.call_args_list], ["page", "page"])
 
 
 if __name__ == "__main__":

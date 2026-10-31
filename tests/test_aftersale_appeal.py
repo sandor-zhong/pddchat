@@ -7,6 +7,7 @@ import queue
 import sqlite3
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +17,64 @@ from main import run_aftersale_serve_mode
 
 
 class AftersaleAppealRulesTest(unittest.TestCase):
+    def test_form_completes_each_group_before_moving_down(self):
+        events = []
+        page, modal = MagicMock(), MagicMock()
+        with ExitStack() as stack:
+            stack.enter_context(patch('aftersale_appeal.open_aftersale_appeal_modal', return_value=modal))
+            stack.enter_context(patch('aftersale_appeal._ordered_appeal_sections', return_value=[(0, '货款申诉'), (1, '运费申诉')]))
+            for name in ('verify_modal_context', 'business_pause', 'save_natural_content_screenshot', 'submit_aftersale_form'):
+                stack.enter_context(patch('aftersale_appeal.' + name))
+            def reason(*args, **kwargs):
+                events.append(('reason', kwargs['section_index'], kwargs['section_item']))
+                return '非以上申诉原因'
+            def amount(*args, **kwargs):
+                events.append(('amount', kwargs['index']))
+                return '6.89' if kwargs['index'] == 0 else '6.36'
+            def upload(modal, field, paths, **kwargs):
+                events.append(('upload', field))
+                return paths
+            stack.enter_context(patch('aftersale_appeal.select_appeal_reason', side_effect=reason))
+            stack.enter_context(patch('aftersale_appeal.fill_maximum_amount', side_effect=amount))
+            stack.enter_context(patch('aftersale_appeal._upload_images', side_effect=upload))
+            stack.enter_context(patch('aftersale_appeal.wait_for_uploads', side_effect=lambda *a: events.append(('wait',))))
+            stack.enter_context(patch('aftersale_appeal.generate_aftersale_description', side_effect=lambda *a: events.append(('generate',)) or '正文'))
+            stack.enter_context(patch('aftersale_appeal.fill_description', side_effect=lambda *a: events.append(('description',))))
+            aftersale_appeal.fill_and_submit_aftersale_form(page, {'order_no':'260001-1', 'record_key':'sequence', 'appeal_item':'运费申诉、货款申诉'}, Path('refund.png'), [Path('chat.png')], '分类', {})
+        expected = []
+        for i, item in enumerate(('货款申诉', '运费申诉')):
+            expected += [('reason',i,item), ('amount',i), ('upload',f'subInfoVOS[{i}].mustImageUrls'), ('upload',f'subInfoVOS[{i}].optionalImageUrls'), ('wait',)]
+        self.assertEqual(events, expected + [('generate',), ('description',)])
+
+    def test_goods_and_freight_select_fallback_in_both_independent_fields(self):
+        for bad_second in (False, True):
+            with self.subTest(bad_second=bad_second):
+                page, modal = MagicMock(), MagicMock()
+                containers = [MagicMock(), MagicMock()]
+                modal.locator.side_effect = lambda selector: containers[1 if '[1]' in selector else 0]
+                containers[0].locator.return_value.input_value.side_effect = ['', aftersale_appeal.GOODS_FALLBACK_REASON]
+                containers[1].locator.return_value.input_value.side_effect = ['', '其他' if bad_second else '其他 / 非以上申诉原因']
+                with patch('aftersale_appeal._ordered_appeal_sections', return_value=[(0, '货款申诉'), (1, '运费申诉')]), patch('aftersale_appeal.stealth_safe_click'), patch('aftersale_appeal._click_cascader_option') as choose:
+                    if bad_second:
+                        with self.assertRaisesRegex(RuntimeError, '运费申诉原因读回校验失败'):
+                            aftersale_appeal._select_appeal_reason(page, modal, '运费申诉、货款申诉')
+                    else:
+                        self.assertEqual(aftersale_appeal._select_appeal_reason(page, modal, '货款申诉、运费申诉'), aftersale_appeal.GOODS_FALLBACK_REASON)
+                    self.assertEqual([c.args[2] for c in choose.call_args_list], ['非以上申诉原因', '其他', '非以上申诉原因'])
+
+    def test_upload_supports_new_voucher_field_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            image = Path(temporary) / 'evidence.png'
+            image.write_bytes(b'test')
+            modal, absent, present = MagicMock(), MagicMock(), MagicMock()
+            absent.count.return_value = 0
+            present.locator.return_value.count.return_value = 1
+            modal.locator.side_effect = [absent, present]
+            with patch('aftersale_appeal.business_pause'):
+                self.assertEqual(aftersale_appeal._upload_images(modal, 'subInfoVOS[0].mustImageUrls', [image], required=True), [image])
+            self.assertEqual(modal.locator.call_args.args[0], '[id="subInfoVOS[0].mustVoucherUrls"]')
+            present.locator.return_value.set_input_files.assert_called_once_with([str(image.resolve())])
+
     def test_all_known_combinations_preserve_items_and_use_expected_reason(self):
         items = [aftersale_appeal.GOODS_APPEAL_ITEM, aftersale_appeal.FREIGHT_APPEAL_ITEM,
                  aftersale_appeal.DISPUTE_APPEAL_ITEM]
@@ -35,14 +94,14 @@ class AftersaleAppealRulesTest(unittest.TestCase):
                         expected = (
                             aftersale_appeal.GOODS_FALLBACK_REASON
                             if aftersale_appeal.GOODS_APPEAL_ITEM in combination
-                            and aftersale_appeal.DISPUTE_APPEAL_ITEM in combination
+                            and (aftersale_appeal.DISPUTE_APPEAL_ITEM in combination
+                                 or aftersale_appeal.FREIGHT_APPEAL_ITEM in combination)
                             else aftersale_appeal.GOODS_PREFERRED_REASON
                         )
                         reason = modal.locator.return_value.locator.return_value
-                        reason.input_value.side_effect = ["", expected]
-                        with patch("aftersale_appeal.stealth_safe_click"), patch("aftersale_appeal._click_cascader_option") as choose:
-                            self.assertEqual(aftersale_appeal.select_appeal_reason(page, modal, value), expected)
-                        self.assertEqual(choose.call_args.args[2], expected)
+                        sections = list(enumerate(combination))
+                        with patch('aftersale_appeal._clean_text', side_effect=combination):
+                            self.assertEqual(aftersale_appeal._ordered_appeal_sections(modal, value), sections)
 
     def test_combination_mismatch_still_blocks_wrong_form(self):
         modal = MagicMock()
@@ -74,6 +133,7 @@ class AftersaleAppealRulesTest(unittest.TestCase):
             aftersale_appeal.GOODS_PREFERRED_REASON, aftersale_appeal.GOODS_FALLBACK_REASON,
         ]
         with (
+            patch('aftersale_appeal._ordered_appeal_sections', return_value=[(0, '货款申诉')]),
             patch("aftersale_appeal.stealth_safe_click"),
             patch("aftersale_appeal._click_cascader_option") as choose,
         ):
@@ -433,6 +493,41 @@ class AftersaleAppealRulesTest(unittest.TestCase):
 
         submit.assert_called_once_with(detail_page, modal, "260001-1")
         modal.get_by_role.assert_not_called()
+
+    def test_combined_forms_upload_every_section_and_block_incomplete_first_section(self):
+        for item, missing in [
+            ("货款申诉、纠纷退款率申诉", False),
+            ("货款申诉、运费申诉、纠纷退款率申诉", False),
+            ("货款申诉、纠纷退款率申诉", True),
+        ]:
+            with self.subTest(item=item, missing=missing), ExitStack() as stack:
+                page, modal = MagicMock(), MagicMock()
+                refund, chat = Path('refund.png'), Path('chat.png')
+                count = len(aftersale_appeal._appeal_items(item))
+                stack.enter_context(patch('aftersale_appeal._ordered_appeal_sections', return_value=list(enumerate(item.split('、')))))
+                stack.enter_context(patch('aftersale_appeal.open_aftersale_appeal_modal', return_value=modal))
+                for name in ('verify_modal_context', 'wait_for_uploads', 'fill_description', 'save_natural_content_screenshot', 'business_pause'):
+                    stack.enter_context(patch('aftersale_appeal.' + name))
+                stack.enter_context(patch('aftersale_appeal.select_appeal_reason', return_value='非以上申诉原因'))
+                stack.enter_context(patch('aftersale_appeal.generate_aftersale_description', return_value='组合申诉描述'))
+                stack.enter_context(patch('aftersale_appeal.fill_maximum_amount', return_value='6.39'))
+                files = [[refund], [chat]] * count
+                if missing:
+                    files[0] = []
+                upload = stack.enter_context(patch('aftersale_appeal._upload_images', side_effect=files))
+                submit = stack.enter_context(patch('aftersale_appeal.submit_aftersale_form'))
+                args = (page, {'order_no':'260001-1', 'record_key':'combo', 'appeal_item':item}, refund, [chat], '分类', {})
+                if missing:
+                    with self.assertRaisesRegex(RuntimeError, '第1组凭证'):
+                        aftersale_appeal.fill_and_submit_aftersale_form(*args)
+                    submit.assert_not_called()
+                else:
+                    aftersale_appeal.fill_and_submit_aftersale_form(*args)
+                    submit.assert_called_once_with(page, modal, '260001-1')
+                self.assertEqual([call.args[1] for call in upload.call_args_list], [
+                    f'subInfoVOS[{i}].{field}' for i in range(1 if missing else count)
+                    for field in ('mustImageUrls', 'optionalImageUrls')
+                ])
 
     def test_submit_requires_exact_button_and_hidden_modal(self) -> None:
         detail_page = MagicMock()

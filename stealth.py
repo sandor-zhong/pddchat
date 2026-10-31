@@ -493,6 +493,8 @@ def create_stealth_context(
         context_args["user_agent"] = user_agent
 
     context_args.update(extra_context_args)
+    if context_args.get("headless"):
+        raise ValueError("系统鼠标操作需要可见的浏览器窗口，不能使用 headless 模式。")
 
     chrome_path = browser_settings.chrome_executable() if engine == "chromium" else ""
     if chrome_path and "executable_path" not in extra_context_args:
@@ -508,6 +510,12 @@ def create_stealth_context(
 
     browser_type = playwright.firefox if engine == "firefox" else playwright.chromium
     context = browser_type.launch_persistent_context(**context_args)
+    from native_mouse import install_system_mouse
+    try:
+        install_system_mouse(context)
+    except Exception:
+        context.close()
+        raise
 
     # 在所有页面（现有 + 未来新开的）加载前注入反检测脚本
     if not native_properties:

@@ -58,8 +58,8 @@ class CollectorWorker(QThread):
                     self.log.emit("正在打开浏览器……")
                     if self.stop_event.is_set():
                         raise Cancelled()
-                    options = dict(user_data_dir=str(profile_path), headless=self.headless and self.mode in ("collect", "service_status", "customer_service", "appeal_amount", "work_order_screenshot", "login_check"),
-                                   viewport={"width": 1440, "height": 1000}, locale="zh-CN")
+                    options = dict(user_data_dir=str(profile_path), headless=False,
+                                   no_viewport=True, locale="zh-CN")
                     if self.channel:
                         options["channel"] = self.channel
                     try:
@@ -70,6 +70,8 @@ class CollectorWorker(QThread):
                         self.log.emit("所选 Chrome/Edge 不可用，正在切换安装包内置 Chromium……")
                         options.pop("channel", None)
                         context = playwright.chromium.launch_persistent_context(**options)
+                    from native_mouse import install_system_mouse
+                    install_system_mouse(context)
                     context.set_default_timeout(10000)
                     page = context.pages[0] if context.pages else context.new_page()
                     if self.mode == "service_status":
